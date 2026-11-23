@@ -1488,7 +1488,7 @@ private fun ExtStreamsScreen(
                                 val sub = listOfNotNull(
                                     stream.quality?.takeIf { it.isNotBlank() }
                                         ?.let { it + "p" },
-                                    stream.type.takeIf { it.isNotBlank() }.uppercase()
+                                    stream.type?.takeIf { it.isNotBlank() }?.uppercase()
                                 ).joinToString(" • ")
                                 if (sub.isNotBlank()) {
                                     Text(text = sub, color = VegaSubText, fontSize = 13.sp)

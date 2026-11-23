@@ -41,6 +41,7 @@ android {
             '-opt-in=kotlinx.serialization.ExperimentalSerializationApi',
             '-opt-in=kotlinx.serialization.InternalSerializationApi',
             '-opt-in=kotlin.ExperimentalStdlibApi',
+            '-opt-in=kotlin.uuid.ExperimentalUuidApi',
             '-opt-in=kotlin.time.ExperimentalTimeApi'
         ]
     }
