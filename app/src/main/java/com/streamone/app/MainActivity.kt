@@ -64,7 +64,9 @@ import androidx.media3.datasource.DefaultHttpDataSource
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
 import androidx.media3.ui.PlayerView
+import androidx.lifecycle.lifecycleScope
 import coil.compose.AsyncImage
+import com.lagradost.cloudstream3.plugins.Repository
 import com.streamone.app.engine.CatalogItem
 import com.streamone.app.engine.EpisodeLink
 import com.streamone.app.engine.Info
@@ -73,6 +75,11 @@ import com.streamone.app.engine.ProviderEngine
 import com.streamone.app.engine.ProviderEntry
 import com.streamone.app.engine.ProviderRepository
 import com.streamone.app.engine.StreamItem
+import com.streamone.app.extensions.ExtDetail
+import com.streamone.app.extensions.ExtensionBridge
+import com.streamone.app.extensions.InstalledPlugin
+import com.streamone.app.extensions.PluginEngine
+import com.streamone.app.extensions.RepoPlugin
 import kotlinx.coroutines.launch
 
 private val Tomato = Color(0xFFFF6347)
@@ -97,17 +104,33 @@ private sealed interface Screen {
     ) : Screen
 
     data class Player(val title: String, val stream: StreamItem) : Screen
+
+    // CloudStream extensions (Phase 4)
+    data object ExtensionsHome : Screen
+    data class ExtPosts(val bridge: ExtensionBridge) : Screen
+    data class ExtDetail(val bridge: ExtensionBridge, val post: Post) : Screen
+    data class ExtStreams(val bridge: ExtensionBridge, val title: String, val data: String) :
+        Screen
 }
 
 class MainActivity : ComponentActivity() {
 
     private lateinit var repository: ProviderRepository
     private lateinit var engine: ProviderEngine
+    private lateinit var pluginEngine: PluginEngine
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         repository = ProviderRepository(applicationContext)
         engine = ProviderEngine(applicationContext, repository)
+        pluginEngine = PluginEngine(applicationContext)
+        // The vendored CloudStream library resolves the app context through
+        // this helper (WebView-based extractors need it).
+        com.lagradost.api.setContext(applicationContext)
+        // Load installed CloudStream extensions in the background.
+        lifecycleScope.launch {
+            pluginEngine.loadAllInstalled()
+        }
         setContent {
             MaterialTheme(
                 colorScheme = darkColorScheme(
@@ -122,7 +145,7 @@ class MainActivity : ComponentActivity() {
                     modifier = Modifier.fillMaxSize(),
                     color = VegaBlack
                 ) {
-                    StreamOneApp(engine)
+                    StreamOneApp(engine, pluginEngine)
                 }
             }
         }
@@ -130,7 +153,7 @@ class MainActivity : ComponentActivity() {
 }
 
 @Composable
-private fun StreamOneApp(engine: ProviderEngine) {
+private fun StreamOneApp(engine: ProviderEngine, pluginEngine: PluginEngine) {
     var backStack by remember { mutableStateOf<List<Screen>>(listOf(Screen.Home)) }
     val current = backStack.last()
 
@@ -147,7 +170,38 @@ private fun StreamOneApp(engine: ProviderEngine) {
     when (val screen = current) {
         is Screen.Home -> HomeScreen(
             engine = engine,
-            onProvider = { navigate(Screen.Posts(it)) }
+            pluginEngine = pluginEngine,
+            onProvider = { navigate(Screen.Posts(it)) },
+            onExtensions = { navigate(Screen.ExtensionsHome) },
+            onExtension = { navigate(Screen.ExtPosts(it)) }
+        )
+
+        is Screen.ExtensionsHome -> ExtensionsHomeScreen(
+            pluginEngine = pluginEngine,
+            onBack = { goBack() }
+        )
+
+        is Screen.ExtPosts -> ExtPostsScreen(
+            bridge = screen.bridge,
+            onBack = { goBack() },
+            onPost = { navigate(Screen.ExtDetail(screen.bridge, it)) }
+        )
+
+        is Screen.ExtDetail -> ExtDetailScreen(
+            bridge = screen.bridge,
+            post = screen.post,
+            onBack = { goBack() },
+            onPlay = { title, data ->
+                navigate(Screen.ExtStreams(screen.bridge, title, data))
+            }
+        )
+
+        is Screen.ExtStreams -> ExtStreamsScreen(
+            bridge = screen.bridge,
+            title = screen.title,
+            data = screen.data,
+            onBack = { goBack() },
+            onStream = { navigate(Screen.Player(screen.title, it)) }
         )
 
         is Screen.Posts -> PostsScreen(
@@ -254,9 +308,16 @@ private fun VegaButton(text: String, onClick: () -> Unit) {
 // ---------------------------------------------------------------------------
 
 @Composable
-private fun HomeScreen(engine: ProviderEngine, onProvider: (ProviderEntry) -> Unit) {
+private fun HomeScreen(
+    engine: ProviderEngine,
+    pluginEngine: PluginEngine,
+    onProvider: (ProviderEntry) -> Unit,
+    onExtensions: () -> Unit,
+    onExtension: (ExtensionBridge) -> Unit
+) {
     var providers by remember { mutableStateOf<List<ProviderEntry>?>(null) }
     var error by remember { mutableStateOf<String?>(null) }
+    var bridges by remember { mutableStateOf<List<ExtensionBridge>>(emptyList()) }
 
     LaunchedEffect(Unit) {
         try {
@@ -264,6 +325,17 @@ private fun HomeScreen(engine: ProviderEngine, onProvider: (ProviderEntry) -> Un
         } catch (e: Exception) {
             error = e.message ?: "Could not load providers"
         }
+    }
+
+    // Plugins load in the background at startup; poll briefly so extension
+    // sources appear on the home screen once they are ready.
+    LaunchedEffect(Unit) {
+        repeat(10) {
+            bridges = pluginEngine.bridges()
+            if (bridges.isNotEmpty()) return@LaunchedEffect
+            kotlinx.coroutines.delay(600)
+        }
+        bridges = pluginEngine.bridges()
     }
 
     Column(
@@ -298,7 +370,8 @@ private fun HomeScreen(engine: ProviderEngine, onProvider: (ProviderEntry) -> Un
             providers!!.isEmpty() -> ErrorText("No providers found. Check your connection.")
             else -> LazyColumn(
                 verticalArrangement = Arrangement.spacedBy(12.dp),
-                contentPadding = PaddingValues(bottom = 16.dp)
+                contentPadding = PaddingValues(bottom = 16.dp),
+                modifier = Modifier.weight(1f)
             ) {
                 items(providers!!) { provider ->
                     Card(
@@ -343,6 +416,57 @@ private fun HomeScreen(engine: ProviderEngine, onProvider: (ProviderEntry) -> Un
                                     fontSize = 13.sp
                                 )
                             }
+                        }
+                    }
+                }
+            }
+        }
+
+        Spacer(modifier = Modifier.height(16.dp))
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text(
+                text = "CLOUDSTREAM EXTENSIONS",
+                color = VegaText,
+                fontSize = 16.sp,
+                fontWeight = FontWeight.SemiBold,
+                modifier = Modifier.weight(1f)
+            )
+            VegaButton(text = "Manage") { onExtensions() }
+        }
+        Spacer(modifier = Modifier.height(8.dp))
+        if (bridges.isEmpty()) {
+            Text(
+                text = "No extensions installed yet. Tap Manage to add a repository.",
+                color = VegaSubText,
+                fontSize = 13.sp,
+                modifier = Modifier.padding(bottom = 12.dp)
+            )
+        } else {
+            LazyColumn(
+                verticalArrangement = Arrangement.spacedBy(12.dp),
+                contentPadding = PaddingValues(bottom = 16.dp),
+                modifier = Modifier.weight(1f)
+            ) {
+                items(bridges) { bridge ->
+                    Card(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clickable { onExtension(bridge) },
+                        shape = RoundedCornerShape(28.dp),
+                        colors = CardDefaults.cardColors(containerColor = VegaSurface)
+                    ) {
+                        Column(modifier = Modifier.padding(16.dp)) {
+                            Text(
+                                text = bridge.displayName,
+                                color = VegaText,
+                                fontSize = 18.sp,
+                                fontWeight = FontWeight.SemiBold
+                            )
+                            Text(
+                                text = "CloudStream extension • ${bridge.language}",
+                                color = VegaSubText,
+                                fontSize = 13.sp
+                            )
                         }
                     }
                 }
@@ -843,5 +967,537 @@ private fun PlayerScreen(stream: StreamItem, title: String, onBack: () -> Unit) 
             },
             modifier = Modifier.fillMaxSize()
         )
+    }
+}
+
+// ---------------------------------------------------------------------------
+// CloudStream extensions (Phase 4): repository management + browsing UI for
+// providers registered by .cs3 plugins, bridged via ExtensionBridge.
+// ---------------------------------------------------------------------------
+
+@Composable
+private fun ExtensionsHomeScreen(
+    pluginEngine: PluginEngine,
+    onBack: () -> Unit
+) {
+    var repoUrlText by remember { mutableStateOf("") }
+    var fetchedRepo by remember { mutableStateOf<Repository?>(null) }
+    var fetchedRepoUrl by remember { mutableStateOf("") }
+    var repoPlugins by remember { mutableStateOf<List<RepoPlugin>>(emptyList()) }
+    var installed by remember { mutableStateOf<List<InstalledPlugin>>(emptyList()) }
+    var busy by remember { mutableStateOf(false) }
+    var status by remember { mutableStateOf<String?>(null) }
+    var refreshKey by remember { mutableStateOf(0) }
+    val scope = rememberCoroutineScope()
+
+    LaunchedEffect(refreshKey) {
+        installed = pluginEngine.installedPlugins()
+    }
+
+    fun isInstalled(plugin: RepoPlugin): InstalledPlugin? =
+        installed.firstOrNull {
+            it.internalName == plugin.plugin.internalName && it.repositoryUrl == plugin.repo.url
+        }
+
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(VegaBlack)
+            .padding(horizontal = 16.dp)
+    ) {
+        TopBar(title = "Extensions", onBack = onBack)
+        Text(
+            text = "Add a CloudStream repository URL, then install extensions (.cs3) from it.",
+            color = VegaSubText,
+            fontSize = 13.sp
+        )
+        Spacer(modifier = Modifier.height(10.dp))
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            OutlinedTextField(
+                value = repoUrlText,
+                onValueChange = { repoUrlText = it },
+                label = { Text("Repository URL") },
+                singleLine = true,
+                modifier = Modifier.weight(1f)
+            )
+            Spacer(modifier = Modifier.width(8.dp))
+            VegaButton(text = "Add") {
+                val normalized = pluginEngine.normalizeRepoUrl(repoUrlText)
+                if (normalized == null) {
+                    status = "That doesn't look like a repository URL."
+                    return@VegaButton
+                }
+                busy = true
+                status = null
+                scope.launch {
+                    try {
+                        val repo = pluginEngine.addRepository(normalized)
+                        fetchedRepo = repo
+                        fetchedRepoUrl = normalized
+                        repoPlugins = pluginEngine.fetchRepoPlugins(normalized, repo)
+                        status = "Loaded ${repoPlugins.size} extensions from ${repo.name}."
+                    } catch (e: Exception) {
+                        status = "Failed to load repository: ${e.message}"
+                    }
+                    busy = false
+                }
+            }
+        }
+        if (busy) LoadingBox()
+        if (status != null) {
+            Text(
+                text = status!!,
+                color = VegaSubText,
+                fontSize = 13.sp,
+                modifier = Modifier.padding(vertical = 8.dp)
+            )
+        }
+
+        LazyColumn(
+            verticalArrangement = Arrangement.spacedBy(10.dp),
+            contentPadding = PaddingValues(bottom = 20.dp)
+        ) {
+            if (installed.isNotEmpty()) {
+                item {
+                    Text(
+                        text = "INSTALLED",
+                        color = Tomato,
+                        fontSize = 14.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        modifier = Modifier.padding(top = 8.dp)
+                    )
+                }
+                items(installed) { plugin ->
+                    Card(
+                        shape = RoundedCornerShape(20.dp),
+                        colors = CardDefaults.cardColors(containerColor = VegaSurface),
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(14.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(
+                                    text = plugin.name,
+                                    color = VegaText,
+                                    fontSize = 15.sp,
+                                    fontWeight = FontWeight.SemiBold
+                                )
+                                Text(
+                                    text = "v${plugin.version}" +
+                                        (plugin.language?.let { " • $it" } ?: ""),
+                                    color = VegaSubText,
+                                    fontSize = 12.sp
+                                )
+                            }
+                            TextButton(onClick = {
+                                busy = true
+                                scope.launch {
+                                    pluginEngine.uninstall(plugin)
+                                    refreshKey++
+                                    busy = false
+                                }
+                            }) {
+                                Text(text = "Uninstall", color = Tomato, fontSize = 13.sp)
+                            }
+                        }
+                    }
+                }
+            }
+
+            if (fetchedRepo != null) {
+                item {
+                    Text(
+                        text = fetchedRepo!!.name.uppercase(),
+                        color = Tomato,
+                        fontSize = 14.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        modifier = Modifier.padding(top = 8.dp)
+                    )
+                }
+                items(repoPlugins) { repoPlugin ->
+                    val existing = isInstalled(repoPlugin)
+                    val plugin = repoPlugin.plugin
+                    Card(
+                        shape = RoundedCornerShape(20.dp),
+                        colors = CardDefaults.cardColors(containerColor = VegaSurface),
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(14.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(
+                                    text = plugin.name,
+                                    color = VegaText,
+                                    fontSize = 15.sp,
+                                    fontWeight = FontWeight.SemiBold
+                                )
+                                val sub = listOfNotNull(
+                                    "v${plugin.version}",
+                                    plugin.language,
+                                    plugin.authors.takeIf { it.isNotEmpty() }
+                                        ?.joinToString(", ")
+                                ).joinToString(" • ")
+                                Text(text = sub, color = VegaSubText, fontSize = 12.sp)
+                                if (!plugin.description.isNullOrBlank()) {
+                                    Text(
+                                        text = plugin.description,
+                                        color = VegaSubText,
+                                        fontSize = 12.sp,
+                                        maxLines = 2,
+                                        overflow = TextOverflow.Ellipsis
+                                    )
+                                }
+                            }
+                            Spacer(modifier = Modifier.width(8.dp))
+                            if (existing != null && existing.version >= plugin.version) {
+                                Text(
+                                    text = "Installed",
+                                    color = VegaSubText,
+                                    fontSize = 13.sp
+                                )
+                            } else {
+                                VegaButton(
+                                    text = if (existing != null) "Update" else "Install"
+                                ) {
+                                    busy = true
+                                    status = null
+                                    scope.launch {
+                                        try {
+                                            pluginEngine.install(repoPlugin)
+                                            status = "Installed ${plugin.name}."
+                                            refreshKey++
+                                        } catch (e: Exception) {
+                                            status =
+                                                "Install failed for ${plugin.name}: ${e.message}"
+                                        }
+                                        busy = false
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun ExtPostCard(post: Post, onPost: (Post) -> Unit) {
+    Column(modifier = Modifier.clickable { onPost(post) }) {
+        Card(
+            shape = RoundedCornerShape(16.dp),
+            colors = CardDefaults.cardColors(containerColor = VegaSurface)
+        ) {
+            AsyncImage(
+                model = post.image,
+                contentDescription = post.title,
+                contentScale = ContentScale.Crop,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .aspectRatio(0.67f)
+            )
+        }
+        Text(
+            text = post.title,
+            color = VegaText,
+            fontSize = 12.sp,
+            maxLines = 2,
+            overflow = TextOverflow.Ellipsis,
+            modifier = Modifier.padding(top = 4.dp)
+        )
+    }
+}
+
+@Composable
+private fun ExtPostsScreen(
+    bridge: ExtensionBridge,
+    onBack: () -> Unit,
+    onPost: (Post) -> Unit
+) {
+    var sections by remember(bridge.id) {
+        mutableStateOf<List<com.streamone.app.extensions.ExtSection>?>(null)
+    }
+    var searchText by remember(bridge.id) { mutableStateOf("") }
+    var searchResults by remember(bridge.id) { mutableStateOf<List<Post>?>(null) }
+    var loading by remember(bridge.id) { mutableStateOf(false) }
+    var error by remember(bridge.id) { mutableStateOf<String?>(null) }
+    val scope = rememberCoroutineScope()
+
+    LaunchedEffect(bridge.id) {
+        loading = true
+        try {
+            sections = bridge.homeSections()
+        } catch (e: Exception) {
+            error = e.message ?: "Failed to load homepage"
+        }
+        loading = false
+    }
+
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(VegaBlack)
+            .padding(horizontal = 16.dp)
+    ) {
+        TopBar(title = bridge.displayName, onBack = onBack)
+
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            OutlinedTextField(
+                value = searchText,
+                onValueChange = { searchText = it },
+                label = { Text("Search") },
+                singleLine = true,
+                modifier = Modifier.weight(1f)
+            )
+            Spacer(modifier = Modifier.width(8.dp))
+            VegaButton(text = "Search") {
+                val query = searchText.trim()
+                if (query.isEmpty()) {
+                    searchResults = null
+                    return@VegaButton
+                }
+                loading = true
+                error = null
+                scope.launch {
+                    try {
+                        searchResults = bridge.search(query)
+                    } catch (e: Exception) {
+                        error = e.message ?: "Search failed"
+                    }
+                    loading = false
+                }
+            }
+        }
+        Spacer(modifier = Modifier.height(10.dp))
+
+        when {
+            error != null -> ErrorText(error!!)
+            loading && sections == null && searchResults == null -> LoadingBox()
+            searchResults != null -> {
+                if (searchResults!!.isEmpty()) {
+                    Text(
+                        text = "No results.",
+                        color = VegaSubText,
+                        fontSize = 14.sp,
+                        modifier = Modifier.padding(16.dp)
+                    )
+                } else {
+                    LazyVerticalGrid(
+                        columns = GridCells.Fixed(3),
+                        horizontalArrangement = Arrangement.spacedBy(10.dp),
+                        verticalArrangement = Arrangement.spacedBy(12.dp)
+                    ) {
+                        items(searchResults!!) { post -> ExtPostCard(post, onPost) }
+                    }
+                }
+            }
+
+            sections.isNullOrEmpty() -> Text(
+                text = "This provider has no homepage. Use search.",
+                color = VegaSubText,
+                fontSize = 14.sp,
+                modifier = Modifier.padding(16.dp)
+            )
+
+            else -> LazyColumn(
+                verticalArrangement = Arrangement.spacedBy(14.dp),
+                contentPadding = PaddingValues(bottom = 20.dp)
+            ) {
+                items(sections!!) { section ->
+                    Column {
+                        Text(
+                            text = section.title,
+                            color = VegaText,
+                            fontSize = 16.sp,
+                            fontWeight = FontWeight.SemiBold
+                        )
+                        Spacer(modifier = Modifier.height(8.dp))
+                        LazyRow(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                            items(section.posts) { post ->
+                                Box(modifier = Modifier.width(110.dp)) {
+                                    ExtPostCard(post, onPost)
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun ExtDetailScreen(
+    bridge: ExtensionBridge,
+    post: Post,
+    onBack: () -> Unit,
+    onPlay: (title: String, data: String) -> Unit
+) {
+    var detail by remember(post.link) { mutableStateOf<ExtDetail?>(null) }
+    var error by remember(post.link) { mutableStateOf<String?>(null) }
+
+    LaunchedEffect(post.link) {
+        try {
+            detail = bridge.details(post.link)
+        } catch (e: Exception) {
+            error = e.message ?: "Failed to load details"
+        }
+    }
+
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(VegaBlack)
+            .padding(horizontal = 16.dp)
+    ) {
+        TopBar(title = post.title, onBack = onBack)
+        when {
+            error != null -> ErrorText(error!!)
+            detail == null -> LoadingBox()
+            else -> {
+                val meta = detail!!
+                LazyColumn(
+                    verticalArrangement = Arrangement.spacedBy(10.dp),
+                    contentPadding = PaddingValues(bottom = 24.dp)
+                ) {
+                    item {
+                        val hero = meta.poster?.takeIf { it.isNotBlank() } ?: meta.image
+                        if (hero.isNotBlank()) {
+                            AsyncImage(
+                                model = hero,
+                                contentDescription = meta.title,
+                                contentScale = ContentScale.Crop,
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .height(210.dp)
+                                    .clip(RoundedCornerShape(20.dp))
+                            )
+                            Spacer(modifier = Modifier.height(12.dp))
+                        }
+                        Text(
+                            text = meta.title,
+                            color = VegaText,
+                            fontSize = 22.sp,
+                            fontWeight = FontWeight.Bold
+                        )
+                        val metaLine = listOfNotNull(
+                            meta.type.replaceFirstChar { it.uppercase() },
+                            meta.year?.toString(),
+                            meta.rating?.takeIf { it.isNotBlank() }?.let { "★ $it" },
+                            meta.tags.takeIf { it.isNotEmpty() }?.joinToString(", ")
+                        ).joinToString(" • ")
+                        if (metaLine.isNotBlank()) {
+                            Text(text = metaLine, color = VegaSubText, fontSize = 13.sp)
+                        }
+                        if (meta.cast.isNotEmpty()) {
+                            Text(
+                                text = "Cast: " + meta.cast.joinToString(", "),
+                                color = VegaSubText,
+                                fontSize = 13.sp
+                            )
+                        }
+                        if (meta.synopsis.isNotBlank()) {
+                            Spacer(modifier = Modifier.height(6.dp))
+                            Text(text = meta.synopsis, color = VegaText, fontSize = 14.sp)
+                        }
+                        Spacer(modifier = Modifier.height(8.dp))
+                    }
+
+                    items(meta.episodes) { episode ->
+                        VegaButton(text = "▶  ${episode.title}") {
+                            onPlay(episode.title, episode.data)
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun ExtStreamsScreen(
+    bridge: ExtensionBridge,
+    title: String,
+    data: String,
+    onBack: () -> Unit,
+    onStream: (StreamItem) -> Unit
+) {
+    var streams by remember(data) { mutableStateOf<List<StreamItem>?>(null) }
+    var error by remember(data) { mutableStateOf<String?>(null) }
+
+    LaunchedEffect(data) {
+        try {
+            streams = bridge.streams(data)
+        } catch (e: Exception) {
+            error = e.message ?: "Failed to load streams"
+        }
+    }
+
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(VegaBlack)
+            .padding(horizontal = 16.dp)
+    ) {
+        TopBar(title = title, onBack = onBack)
+        Text(
+            text = "Choose a server",
+            color = VegaSubText,
+            fontSize = 14.sp,
+            modifier = Modifier.padding(bottom = 10.dp)
+        )
+        when {
+            error != null -> ErrorText(error!!)
+            streams == null -> LoadingBox()
+            streams!!.isEmpty() -> ErrorText("No streams found for this title.")
+            else -> LazyColumn(
+                verticalArrangement = Arrangement.spacedBy(10.dp),
+                contentPadding = PaddingValues(bottom = 20.dp)
+            ) {
+                items(streams!!) { stream ->
+                    Card(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clickable { onStream(stream) },
+                        shape = RoundedCornerShape(20.dp),
+                        colors = CardDefaults.cardColors(containerColor = VegaSurface)
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(16.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text(
+                                text = "▶",
+                                color = Tomato,
+                                fontSize = 18.sp,
+                                fontWeight = FontWeight.Bold
+                            )
+                            Spacer(modifier = Modifier.width(12.dp))
+                            Column {
+                                Text(
+                                    text = stream.server,
+                                    color = VegaText,
+                                    fontSize = 16.sp,
+                                    fontWeight = FontWeight.SemiBold
+                                )
+                                val sub = listOfNotNull(
+                                    stream.quality?.takeIf { it.isNotBlank() }
+                                        ?.let { it + "p" },
+                                    stream.type.takeIf { it.isNotBlank() }.uppercase()
+                                ).joinToString(" • ")
+                                if (sub.isNotBlank()) {
+                                    Text(text = sub, color = VegaSubText, fontSize = 13.sp)
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 }

@@ -10,6 +10,8 @@ dependencyResolutionManagement {
     repositories {
         google()
         mavenCentral()
+        // JitPack: NiceHttp + NewPipeExtractor (CloudStream library dependencies)
+        maven { url 'https://jitpack.io' }
     }
 }
 rootProject.name = "StreamOne"
