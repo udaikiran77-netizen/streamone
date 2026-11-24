@@ -1,124 +1,171 @@
 package com.streamone.app.engine
 
+import okhttp3.Call
+import okhttp3.Callback
 import okhttp3.MediaType.Companion.toMediaTypeOrNull
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
-import org.json.JSONObject
-import java.util.Base64
+import okhttp3.Response
+import java.io.IOException
 import java.util.concurrent.TimeUnit
 
 /**
- * Synchronous HTTP executor behind the JS `__nativeHttp` bridge.
+ * OkHttp executor behind the WebView harness's RPC bridge.
  *
- * The axios shim in assets/engine/axios-shim.js serialises each request to
- * JSON: { url, method, headers, data(string|null), timeout(ms), responseType }
- * and this object performs it with OkHttp, returning a JSON string:
- * { status, statusText, headers, body } — plus `bodyBase64: true` when the
- * provider asked for an arraybuffer, or { status: 0, error } on transport
- * failure so the shim can reject like a real network error.
+ * Requests arrive from JS (assets/engine/harness.js) already normalised to
+ * the Vega sandbox's wire shape: a URL, a method, an ordered list of header
+ * pairs, and a body that is either absent, text, or base64. Responses keep
+ * their headers as an ordered pair list — duplicate names (above all
+ * multiple Set-Cookie headers) survive, which the per-provider cookie jar
+ * and axios's set-cookie handling depend on. Bodies are returned as raw
+ * bytes; the JS side base64-decodes them.
  *
- * Everything here runs on the provider engine's single JS thread: the bridge
- * call blocks until the response arrives, which is exactly what the
- * synchronous QuickJS bridge requires.
+ * Everything is asynchronous (OkHttp enqueue): the WebView's JS thread only
+ * ever waits on promises, never on the network.
  */
 object HttpBridge {
 
-    /** Default User-Agent (same Edge UA the Vega template sends). */
+    /** Default User-Agent for repository downloads (manifests, modules). */
     const val DEFAULT_USER_AGENT =
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
             "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Edg/120.0.0.0"
 
-    private val baseClient: OkHttpClient = OkHttpClient.Builder()
-        .connectTimeout(20, TimeUnit.SECONDS)
-        .readTimeout(30, TimeUnit.SECONDS)
-        .writeTimeout(30, TimeUnit.SECONDS)
-        .followRedirects(true)
-        .followSslRedirects(true)
-        .build()
+    private val followClient: OkHttpClient = buildClient(followRedirects = true)
+    private val noFollowClient: OkHttpClient = buildClient(followRedirects = false)
+
+    private fun buildClient(followRedirects: Boolean): OkHttpClient =
+        OkHttpClient.Builder()
+            .connectTimeout(20, TimeUnit.SECONDS)
+            .readTimeout(30, TimeUnit.SECONDS)
+            .writeTimeout(30, TimeUnit.SECONDS)
+            .followRedirects(followRedirects)
+            .followSslRedirects(followRedirects)
+            .build()
 
     /** Shared client for plain GETs from the repository layer. */
-    fun client(): OkHttpClient = baseClient
+    fun client(): OkHttpClient = followClient
 
-    fun execute(requestJson: String): String {
-        val out = JSONObject()
-        try {
-            val request = JSONObject(requestJson)
-            val url = request.optString("url")
-            if (url.isBlank()) {
-                out.put("status", 0)
-                out.put("error", "Missing URL in native HTTP request")
-                return out.toString()
-            }
-            val method = request.optString("method", "GET").uppercase()
-            val timeoutMs = request.optLong("timeout", 0L)
-            val responseType = request.optString("responseType", "")
+    /** One RPC HTTP request, as decoded from the harness payload. */
+    data class BridgeRequest(
+        val url: String,
+        val method: String,
+        /** Ordered header pairs; duplicate names are allowed. */
+        val headers: List<Pair<String, String>>,
+        val bodyText: String?,
+        val bodyBase64: String?,
+        val contentType: String?,
+        val timeoutMs: Long,
+        val followRedirects: Boolean
+    )
 
-            val builder = Request.Builder().url(url)
+    /** One RPC HTTP response. [headers] preserves order and duplicates. */
+    data class BridgeResponse(
+        val status: Int,
+        val statusText: String,
+        /** Final URL after any redirects OkHttp followed. */
+        val finalUrl: String,
+        val headers: List<Pair<String, String>>,
+        val body: ByteArray
+    ) {
+        fun headerValues(name: String): List<String> =
+            headers.filter { it.first.equals(name, ignoreCase = true) }.map { it.second }
+    }
 
-            var hasUserAgent = false
-            var contentType: String? = null
-            val headersJson = request.optJSONObject("headers")
-            if (headersJson != null) {
-                val keys = headersJson.keys()
-                while (keys.hasNext()) {
-                    val name = keys.next()
-                    val value = headersJson.opt(name)
-                    if (value == null || value == JSONObject.NULL) continue
-                    val text = value.toString()
-                    builder.header(name, text)
-                    if (name.equals("User-Agent", ignoreCase = true)) hasUserAgent = true
-                    if (name.equals("Content-Type", ignoreCase = true)) contentType = text
-                }
-            }
-            if (!hasUserAgent) {
-                builder.header("User-Agent", DEFAULT_USER_AGENT)
-            }
-
-            val data: String? = if (request.isNull("data")) null else request.optString("data", "")
-            when (method) {
-                "GET" -> builder.get()
-                "HEAD" -> builder.head()
-                "DELETE" -> builder.delete()
-                "POST", "PUT", "PATCH" -> {
-                    val body = (data ?: "").toRequestBody(contentType?.toMediaTypeOrNull())
-                    when (method) {
-                        "POST" -> builder.post(body)
-                        "PUT" -> builder.put(body)
-                        else -> builder.patch(body)
-                    }
-                }
-                else -> builder.method(method, null)
-            }
-
-            val callClient = if (timeoutMs > 0) {
-                baseClient.newBuilder()
-                    .callTimeout(timeoutMs, TimeUnit.MILLISECONDS)
-                    .build()
-            } else {
-                baseClient
-            }
-
-            callClient.newCall(builder.build()).execute().use { response ->
-                out.put("status", response.code)
-                out.put("statusText", response.message)
-                val responseHeaders = JSONObject()
-                for ((name, value) in response.headers) {
-                    responseHeaders.put(name, value)
-                }
-                out.put("headers", responseHeaders)
-                if (responseType == "arraybuffer") {
-                    val bytes = response.body?.bytes() ?: ByteArray(0)
-                    out.put("body", Base64.getEncoder().encodeToString(bytes))
-                    out.put("bodyBase64", true)
-                } else {
-                    out.put("body", response.body?.string() ?: "")
-                }
-            }
+    /**
+     * Executes [request] asynchronously. The callback receives a failure
+     * only for transport-level errors (DNS, timeouts, TLS, malformed URL);
+     * any HTTP status — including 4xx/5xx — is a successful [BridgeResponse],
+     * matching fetch() semantics.
+     */
+    fun executeAsync(request: BridgeRequest, callback: (Result<BridgeResponse>) -> Unit) {
+        val call: Call = try {
+            buildCall(request)
         } catch (e: Exception) {
-            out.put("status", 0)
-            out.put("error", e.message ?: e.javaClass.simpleName)
+            callback(Result.failure(e))
+            return
         }
-        return out.toString()
+        call.enqueue(object : Callback {
+            override fun onFailure(call: Call, e: IOException) {
+                callback(Result.failure(e))
+            }
+
+            override fun onResponse(call: Call, response: Response) {
+                try {
+                    response.use {
+                        val pairs = ArrayList<Pair<String, String>>()
+                        for ((name, value) in it.headers) {
+                            pairs.add(name to value)
+                        }
+                        callback(
+                            Result.success(
+                                BridgeResponse(
+                                    status = it.code,
+                                    statusText = it.message,
+                                    finalUrl = it.request.url.toString(),
+                                    headers = pairs,
+                                    body = it.body?.bytes() ?: ByteArray(0)
+                                )
+                            )
+                        )
+                    }
+                } catch (e: Exception) {
+                    callback(Result.failure(e))
+                }
+            }
+        })
+    }
+
+    private fun buildCall(request: BridgeRequest): Call {
+        val builder = Request.Builder().url(request.url)
+
+        var contentType = request.contentType
+        for ((name, value) in request.headers) {
+            builder.addHeader(name, value)
+            if (name.equals("Content-Type", ignoreCase = true)) contentType = value
+        }
+
+        val method = request.method.uppercase()
+        val hasBody = method == "POST" || method == "PUT" || method == "PATCH" ||
+            request.bodyText != null || request.bodyBase64 != null
+        val bodyBytes: ByteArray? = when {
+            request.bodyBase64 != null ->
+                android.util.Base64.decode(request.bodyBase64, android.util.Base64.DEFAULT)
+            request.bodyText != null -> request.bodyText.toByteArray(Charsets.UTF_8)
+            hasBody -> ByteArray(0)
+            else -> null
+        }
+        when (method) {
+            "GET" -> builder.get()
+            "HEAD" -> builder.head()
+            "DELETE" -> if (bodyBytes != null) {
+                builder.delete(bodyBytes.toRequestBody(contentType?.toMediaTypeOrNull()))
+            } else {
+                builder.delete()
+            }
+            "POST", "PUT", "PATCH" -> {
+                val body = (bodyBytes ?: ByteArray(0))
+                    .toRequestBody(contentType?.toMediaTypeOrNull())
+                when (method) {
+                    "POST" -> builder.post(body)
+                    "PUT" -> builder.put(body)
+                    else -> builder.patch(body)
+                }
+            }
+            else -> builder.method(
+                method,
+                bodyBytes?.toRequestBody(contentType?.toMediaTypeOrNull())
+            )
+        }
+
+        val base = if (request.followRedirects) followClient else noFollowClient
+        val client = if (request.timeoutMs > 0) {
+            base.newBuilder()
+                .callTimeout(request.timeoutMs, TimeUnit.MILLISECONDS)
+                .build()
+        } else {
+            base
+        }
+        return client.newCall(builder.build())
     }
 }

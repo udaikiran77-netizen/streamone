@@ -12,17 +12,16 @@ import java.io.File
  * Owns everything that comes from the network/disk side of the provider
  * system: the two provider manifests and the compiled provider modules.
  *
- * Manifests (merged, user's own repo first so its providers win value
- * collisions):
- *   - https://raw.githubusercontent.com/udaikiran77-netizen/vega-providers/main/manifest.json
- *   - https://raw.githubusercontent.com/Zenda-Cross/vega-providers/main/manifest.json
+ * Sources are base URLs, exactly like the Vega app's extension sources:
+ * the manifest lives at <base>/manifest.json and provider modules at
+ * <base>/dist/<value>/<module>.js (Vega's getProviderFilesUrl shape).
  *
- * Modules are the esbuild CommonJS bundles the Vega app consumes, fetched
- * through jsDelivr and cached on disk:
- *   https://cdn.jsdelivr.net/gh/<owner>/<repo>@main/dist/<value>/<module>.js
+ *   - https://cdn.jsdelivr.net/gh/udaikiran77-netizen/vega-providers@main
+ *   - https://cdn.jsdelivr.net/gh/Zenda-Cross/vega-providers@main
  *
- * Both manifests and modules are cached with a TTL and fall back to the
- * stale cache when the network is unavailable.
+ * Manifests are merged with the user's own repo first, so its providers
+ * win value collisions. Both manifests and modules are cached with a TTL
+ * and fall back to the stale cache when the network is unavailable.
  */
 class ProviderRepository(context: Context) {
 
@@ -30,21 +29,24 @@ class ProviderRepository(context: Context) {
         val tag: String,
         val owner: String,
         val repo: String,
-        val manifestUrl: String
-    )
+        /** Source base URL; the manifest is "$baseUrl/manifest.json". */
+        val baseUrl: String
+    ) {
+        val manifestUrl: String get() = "$baseUrl/manifest.json"
+    }
 
     private val sources = listOf(
         ManifestSource(
             tag = "udai",
             owner = "udaikiran77-netizen",
             repo = "vega-providers",
-            manifestUrl = "https://raw.githubusercontent.com/udaikiran77-netizen/vega-providers/main/manifest.json"
+            baseUrl = "https://cdn.jsdelivr.net/gh/udaikiran77-netizen/vega-providers@main"
         ),
         ManifestSource(
             tag = "zenda",
             owner = "Zenda-Cross",
             repo = "vega-providers",
-            manifestUrl = "https://raw.githubusercontent.com/Zenda-Cross/vega-providers/main/manifest.json"
+            baseUrl = "https://cdn.jsdelivr.net/gh/Zenda-Cross/vega-providers@main"
         )
     )
 
