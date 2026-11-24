@@ -412,7 +412,9 @@ fun DownloadsTab(
                     Card(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .clickable { onPlayLocal(file) },
+                            .pressClickable(pressedScale = 0.98f) {
+                                onPlayLocal(file)
+                            },
                         shape = RoundedCornerShape(20.dp),
                         colors = CardDefaults.cardColors(containerColor = VegaSurface)
                     ) {
@@ -589,7 +591,9 @@ fun SettingsTab(
                 Row(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .clickable(enabled = !checking) { runManualCheck() }
+                        .pressClickable(pressedScale = 0.98f, enabled = !checking) {
+                            runManualCheck()
+                        }
                         .padding(horizontal = 16.dp, vertical = 14.dp),
                     verticalAlignment = Alignment.CenterVertically
                 ) {
@@ -733,7 +737,7 @@ private fun SettingsRow(
     Row(
         modifier = Modifier
             .fillMaxWidth()
-            .clickable { onClick() }
+            .pressClickable(pressedScale = 0.98f) { onClick() }
             .padding(horizontal = 16.dp, vertical = 14.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
@@ -858,7 +862,7 @@ private fun ProviderRow(
     Card(
         modifier = Modifier
             .fillMaxWidth()
-            .clickable { onClick() },
+            .pressClickable(pressedScale = 0.98f) { onClick() },
         shape = RoundedCornerShape(20.dp),
         colors = CardDefaults.cardColors(
             containerColor = if (selected) VegaSurfaceHigh else VegaSurface

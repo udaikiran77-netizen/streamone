@@ -1,5 +1,9 @@
 package com.streamone.app.ui
 
+import androidx.compose.animation.core.LinearEasing
+import androidx.compose.animation.core.animateDpAsState
+import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
@@ -17,6 +21,7 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.pager.HorizontalPager
 import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.foundation.shape.CircleShape
@@ -31,6 +36,8 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.clipToBounds
+import androidx.compose.ui.draw.scale
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.layout.ContentScale
@@ -193,7 +200,7 @@ private fun SourceChip(
         modifier = Modifier
             .clip(RoundedCornerShape(24.dp))
             .background(if (selected) Tomato else VegaSurface)
-            .clickable { onClick() }
+            .pressClickable(pressedScale = 0.94f) { onClick() }
             .padding(horizontal = 14.dp, vertical = 8.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
@@ -283,8 +290,9 @@ private fun ProviderHomeBody(
                     HeroPager(posts = heroPosts, onOpen = onOpenPost)
                 }
             }
-            items(rows) { row ->
-                Column(modifier = Modifier.padding(top = 18.dp)) {
+            itemsIndexed(rows) { index, row ->
+                StaggeredIn(index = index + 1) {
+                    Column(modifier = Modifier.padding(top = 18.dp)) {
                     Text(
                         text = row.title,
                         color = VegaText,
@@ -321,6 +329,7 @@ private fun ProviderHomeBody(
                                 )
                             }
                         }
+                    }
                     }
                 }
             }
@@ -360,13 +369,28 @@ private fun HeroPager(posts: List<Post>, onOpen: (Post) -> Unit) {
             modifier = Modifier.fillMaxSize()
         ) { page ->
             val post = posts[page]
-            Box(modifier = Modifier.fillMaxSize()) {
+            Box(modifier = Modifier.fillMaxSize().clipToBounds()) {
+                // Ken Burns: the current page's artwork slowly zooms in
+                // across its dwell time; other pages rest at scale 1.
+                val isCurrent = pagerState.currentPage == page
+                var zoomArmed by remember(post.link) { mutableStateOf(false) }
+                LaunchedEffect(isCurrent) { zoomArmed = isCurrent }
+                val zoom by animateFloatAsState(
+                    targetValue = if (zoomArmed) 1.08f else 1f,
+                    animationSpec = if (zoomArmed) {
+                        tween(durationMillis = 5200, easing = LinearEasing)
+                    } else {
+                        vegaTweenSpec(300)
+                    },
+                    label = "heroKenBurns"
+                )
                 AsyncImage(
                     model = post.image,
                     contentDescription = post.title,
                     contentScale = ContentScale.Crop,
                     modifier = Modifier
                         .fillMaxSize()
+                        .scale(zoom)
                         .background(VegaSurface)
                 )
                 // Bottom gradient into black, like Vega's hero.
@@ -412,31 +436,39 @@ private fun HeroPager(posts: List<Post>, onOpen: (Post) -> Unit) {
             }
         }
 
-        // Page dots.
+        // Page dots — the active one stretches into a tomato pill.
         if (posts.size > 1) {
             Row(
                 modifier = Modifier
                     .align(Alignment.BottomEnd)
                     .padding(end = 16.dp, bottom = 22.dp),
-                horizontalArrangement = Arrangement.spacedBy(5.dp)
+                horizontalArrangement = Arrangement.spacedBy(5.dp),
+                verticalAlignment = Alignment.CenterVertically
             ) {
                 repeat(posts.size) { index ->
-                    Box(
-                        modifier = Modifier
-                            .size(if (index == pagerState.currentPage) 8.dp else 6.dp)
-                            .clip(CircleShape)
-                            .background(
-                                if (index == pagerState.currentPage) {
-                                    Tomato
-                                } else {
-                                    Color.White.copy(alpha = 0.4f)
-                                }
-                            )
-                    )
+                    HeroDot(active = index == pagerState.currentPage)
                 }
             }
         }
     }
+}
+
+@Composable
+private fun HeroDot(active: Boolean) {
+    val width by animateDpAsState(
+        targetValue = if (active) 18.dp else 6.dp,
+        animationSpec = VegaDpSpring,
+        label = "heroDot"
+    )
+    Box(
+        modifier = Modifier
+            .width(width)
+            .height(6.dp)
+            .clip(CircleShape)
+            .background(
+                if (active) Tomato else Color.White.copy(alpha = 0.4f)
+            )
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -488,8 +520,9 @@ fun ExtSectionsBody(bridge: ExtensionBridge, onPost: (Post) -> Unit) {
                 if (heroPosts.isNotEmpty()) {
                     item { HeroPager(posts = heroPosts, onOpen = onPost) }
                 }
-                items(sections!!) { section ->
-                    Column(modifier = Modifier.padding(top = 18.dp)) {
+                itemsIndexed(sections!!) { index, section ->
+                    StaggeredIn(index = index + 1) {
+                        Column(modifier = Modifier.padding(top = 18.dp)) {
                         Text(
                             text = section.title,
                             color = VegaText,
@@ -509,6 +542,7 @@ fun ExtSectionsBody(bridge: ExtensionBridge, onPost: (Post) -> Unit) {
                                     onClick = { onPost(post) }
                                 )
                             }
+                        }
                         }
                     }
                 }

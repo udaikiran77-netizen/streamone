@@ -1,21 +1,28 @@
 package com.streamone.app.ui
 
+import android.os.Build
+import androidx.compose.animation.animateContentSize
 import androidx.compose.foundation.background
-import androidx.compose.foundation.clickable
+import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyRow
+import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Card
@@ -23,6 +30,7 @@ import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -30,13 +38,19 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
+import androidx.compose.ui.draw.blur
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.clipToBounds
+import androidx.compose.ui.draw.scale
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import coil.compose.AsyncImage
@@ -49,6 +63,7 @@ import com.streamone.app.engine.StreamItem
 import com.streamone.app.extensions.ExtDetail
 import com.streamone.app.extensions.ExtensionBridge
 import kotlinx.coroutines.launch
+import kotlin.math.roundToInt
 
 /** What the inline streams panel is currently resolving. */
 private data class StreamTarget(
@@ -60,11 +75,37 @@ private data class StreamTarget(
     val episodeIndex: Int = -1
 )
 
+/**
+ * Splits provider tags into (year, genres): tags often arrive comma-joined
+ * ("Action, Drama") and may embed a 4-digit year, which Vega shows in the
+ * meta line rather than as a chip.
+ */
+private fun splitTags(tags: List<String>): Pair<String?, List<String>> {
+    val flat = tags
+        .flatMap { it.split(",") }
+        .map { it.trim() }
+        .filter { it.isNotEmpty() }
+    val year = flat.firstOrNull { it.matches(Regex("\\d{4}")) }
+    val genres = flat.filter { it != year }.distinct().take(10)
+    return year to genres
+}
+
+private fun castInitials(name: String): String {
+    val parts = name.trim().split(Regex("\\s+")).filter { it.isNotEmpty() }
+    return when {
+        parts.isEmpty() -> "?"
+        parts.size == 1 -> parts[0].take(1).uppercase()
+        else -> (parts[0].take(1) + parts[parts.size - 1].take(1)).uppercase()
+    }
+}
+
 // ---------------------------------------------------------------------------
-// Vega Info layout for provider content: backdrop with a bottom gradient
-// into black, title + meta + synopsis, then link groups; tapping a link or
-// episode expands the streams panel (servers with quality/type chips and a
-// download action per stream) right underneath it.
+// Vega Info layout for provider content: a backdrop zone (blurred when the
+// only artwork is a portrait poster, like Vega's Info.tsx) with the poster
+// card and title block overlapping its bottom edge, an action row, storyline
+// and cast, then link groups; tapping a link or episode expands the streams
+// panel (servers with quality/type chips and a download action per stream)
+// right underneath it.
 // ---------------------------------------------------------------------------
 
 @Composable
@@ -78,6 +119,16 @@ fun InfoScreen(
 ) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
+    val listState = rememberLazyListState()
+    val headerParallax by remember {
+        derivedStateOf {
+            if (listState.firstVisibleItemIndex == 0) {
+                listState.firstVisibleItemScrollOffset.toFloat()
+            } else {
+                1000f
+            }
+        }
+    }
 
     var info by remember(post.link) { mutableStateOf<Info?>(null) }
     var error by remember(post.link) { mutableStateOf<String?>(null) }
@@ -88,6 +139,7 @@ fun InfoScreen(
     }
     var episodesLoadingFor by remember(post.link) { mutableStateOf<String?>(null) }
     var episodesError by remember(post.link) { mutableStateOf<String?>(null) }
+    var pendingPlayLink by remember(post.link) { mutableStateOf<String?>(null) }
 
     var target by remember(post.link) { mutableStateOf<StreamTarget?>(null) }
     var streams by remember(post.link) { mutableStateOf<List<StreamItem>?>(null) }
@@ -108,6 +160,21 @@ fun InfoScreen(
         }
     }
 
+    fun toggleSaved() {
+        val meta = info
+        saved = watchlist.toggle(
+            WatchlistItem(
+                kind = "provider",
+                sourceId = provider.id,
+                sourceName = provider.displayName,
+                title = post.title,
+                link = post.link,
+                image = post.image,
+                type = meta?.type ?: ""
+            )
+        )
+    }
+
     fun selectTarget(newTarget: StreamTarget) {
         if (target?.key == newTarget.key && streams != null) {
             target = null
@@ -125,6 +192,77 @@ fun InfoScreen(
                 streamsError = e.message ?: "Failed to load streams"
             }
             streamsLoading = false
+        }
+    }
+
+    fun episodeTarget(
+        episodes: List<EpisodeLink>,
+        index: Int,
+        type: String
+    ): StreamTarget {
+        val episode = episodes[index]
+        return StreamTarget(
+            key = episode.link,
+            title = episode.title,
+            link = episode.link,
+            type = type,
+            episodes = episodes.map { EpisodeRef(title = it.title, key = it.link) },
+            episodeIndex = index
+        )
+    }
+
+    fun loadEpisodes(episodesLink: String) {
+        if (episodesLoadingFor == episodesLink) return
+        episodesLoadingFor = episodesLink
+        episodesError = null
+        scope.launch {
+            try {
+                val loaded = engine.getEpisodes(provider, episodesLink)
+                episodesByLink = episodesByLink + (episodesLink to loaded)
+            } catch (e: Exception) {
+                episodesError = e.message ?: "Failed to load episodes"
+            }
+            episodesLoadingFor = null
+        }
+    }
+
+    // The header Play button asked for episodes that were still loading:
+    // once they arrive, open the first episode's streams.
+    LaunchedEffect(episodesByLink, pendingPlayLink) {
+        val link = pendingPlayLink ?: return@LaunchedEffect
+        val episodes = episodesByLink[link]
+        if (!episodes.isNullOrEmpty()) {
+            pendingPlayLink = null
+            selectTarget(episodeTarget(episodes, 0, "series"))
+        }
+    }
+
+    fun playFirst() {
+        val meta = info ?: return
+        val first = meta.linkList.firstOrNull() ?: return
+        scope.launch { listState.animateScrollToItem(2) }
+        when {
+            first.directLinks.isNotEmpty() -> {
+                val direct = first.directLinks.first()
+                selectTarget(
+                    StreamTarget(
+                        key = direct.link,
+                        title = direct.title,
+                        link = direct.link,
+                        type = direct.type ?: meta.type
+                    )
+                )
+            }
+
+            first.episodesLink != null -> {
+                val episodes = episodesByLink[first.episodesLink]
+                if (!episodes.isNullOrEmpty()) {
+                    selectTarget(episodeTarget(episodes, 0, "series"))
+                } else {
+                    pendingPlayLink = first.episodesLink
+                    loadEpisodes(first.episodesLink)
+                }
+            }
         }
     }
 
@@ -151,31 +289,33 @@ fun InfoScreen(
 
     val meta = info
     LazyColumn(
+        state = listState,
         modifier = Modifier
             .fillMaxSize()
             .background(VegaBlack),
         contentPadding = PaddingValues(bottom = 28.dp)
     ) {
         item {
-            InfoHeader(
-                image = meta?.poster?.takeIf { it.isNotBlank() }
-                    ?: meta?.image?.takeIf { it.isNotBlank() }
-                    ?: post.image,
+            val backdrop = meta?.image?.takeIf { it.isNotBlank() } ?: post.image
+            val poster = meta?.poster?.takeIf { it.isNotBlank() }
+                ?: meta?.image?.takeIf { it.isNotBlank() }
+                ?: post.image
+            val (tagYear, _) = splitTags(meta?.tags ?: emptyList())
+            BackdropHeader(
+                backdropUrl = backdrop,
+                posterUrl = poster,
+                posterLike = poster == backdrop,
+                title = meta?.title ?: post.title,
+                rating = meta?.rating,
+                facts = listOfNotNull(
+                    meta?.type?.replaceFirstChar { it.uppercase() },
+                    tagYear
+                ).joinToString("  •  "),
+                sourceName = provider.displayName,
                 saved = saved,
+                parallaxPx = headerParallax,
                 onBack = onBack,
-                onToggleSaved = {
-                    saved = watchlist.toggle(
-                        WatchlistItem(
-                            kind = "provider",
-                            sourceId = provider.id,
-                            sourceName = provider.displayName,
-                            title = post.title,
-                            link = post.link,
-                            image = post.image,
-                            type = meta?.type ?: ""
-                        )
-                    )
-                }
+                onToggleSaved = { toggleSaved() }
             )
         }
 
@@ -188,36 +328,35 @@ fun InfoScreen(
 
             else -> {
                 item {
-                    Column(modifier = Modifier.padding(horizontal = 16.dp)) {
-                        Text(
-                            text = meta.title,
-                            color = VegaText,
-                            fontSize = 24.sp,
-                            fontWeight = FontWeight.Bold
-                        )
-                        Spacer(modifier = Modifier.height(8.dp))
-                        val metaLine = listOfNotNull(
-                            meta.type.replaceFirstChar { it.uppercase() },
-                            meta.rating?.takeIf { it.isNotBlank() }?.let { "★ $it" },
-                            meta.tags.takeIf { it.isNotEmpty() }
-                                ?.joinToString(", ")
-                        ).joinToString("  •  ")
-                        if (metaLine.isNotBlank()) {
-                            Text(text = metaLine, color = VegaSubText, fontSize = 13.sp)
-                        }
-                        Spacer(modifier = Modifier.height(10.dp))
-                        MetaChip(text = provider.displayName, accent = true)
-                        if (meta.cast.isNotEmpty()) {
-                            Spacer(modifier = Modifier.height(10.dp))
-                            Text(
-                                text = "Cast: " + meta.cast.joinToString(", "),
-                                color = VegaSubText,
-                                fontSize = 13.sp
+                    StaggeredIn(index = 1) {
+                        Column(modifier = Modifier.fillMaxWidth()) {
+                            val (_, genres) = splitTags(meta.tags)
+                            if (genres.isNotEmpty()) {
+                                LazyRow(
+                                    contentPadding = PaddingValues(horizontal = 16.dp),
+                                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                    modifier = Modifier.padding(top = 14.dp)
+                                ) {
+                                    items(genres) { genre -> MetaChip(text = genre) }
+                                }
+                            }
+                            Spacer(modifier = Modifier.height(16.dp))
+                            InfoActionRow(
+                                saved = saved,
+                                onPlay = { playFirst() },
+                                onToggleSaved = { toggleSaved() }
                             )
-                        }
-                        if (meta.synopsis.isNotBlank()) {
-                            Spacer(modifier = Modifier.height(10.dp))
-                            Text(text = meta.synopsis, color = VegaText, fontSize = 14.sp)
+                            if (meta.synopsis.isNotBlank()) {
+                                Spacer(modifier = Modifier.height(22.dp))
+                                StorylineBlock(
+                                    synopsis = meta.synopsis,
+                                    modifier = Modifier.padding(horizontal = 16.dp)
+                                )
+                            }
+                            if (meta.cast.isNotEmpty()) {
+                                Spacer(modifier = Modifier.height(22.dp))
+                                CastRow(cast = meta.cast)
+                            }
                         }
                     }
                 }
@@ -226,7 +365,7 @@ fun InfoScreen(
                     item {
                         Row(
                             modifier = Modifier.padding(
-                                start = 16.dp, end = 16.dp, top = 22.dp, bottom = 10.dp
+                                start = 16.dp, end = 16.dp, top = 24.dp, bottom = 10.dp
                             ),
                             verticalAlignment = Alignment.CenterVertically,
                             horizontalArrangement = Arrangement.spacedBy(8.dp)
@@ -260,31 +399,34 @@ fun InfoScreen(
                             }
                             if (target?.key == direct.link) {
                                 item {
-                                    StreamsPanel(
-                                        loading = streamsLoading,
-                                        error = streamsError,
-                                        streams = streams,
-                                        downloadNote = downloadNote,
-                                        onRetry = {
-                                            target?.let { selectTarget(it) }
-                                        },
-                                        onPlay = { stream, index ->
-                                            playStream(stream, index)
-                                        },
-                                        onDownload = { stream ->
-                                            val id = DownloadsHelper.enqueue(
-                                                context,
-                                                target?.title ?: meta.title,
-                                                stream
-                                            )
-                                            downloadNote = if (id >= 0) {
-                                                "Download started — track it from the " +
-                                                    "notification shade or Downloads tab."
-                                            } else {
-                                                "Could not start this download on this device."
+                                    StaggeredIn(index = 0) {
+                                        StreamsPanel(
+                                            loading = streamsLoading,
+                                            error = streamsError,
+                                            streams = streams,
+                                            downloadNote = downloadNote,
+                                            onRetry = {
+                                                target?.let { selectTarget(it) }
+                                            },
+                                            onPlay = { stream, index ->
+                                                playStream(stream, index)
+                                            },
+                                            onDownload = { stream ->
+                                                val id = DownloadsHelper.enqueue(
+                                                    context,
+                                                    target?.title ?: meta.title,
+                                                    stream
+                                                )
+                                                downloadNote = if (id >= 0) {
+                                                    "Download started — track it from the " +
+                                                        "notification shade or Downloads tab."
+                                                } else {
+                                                    "Could not start this download on " +
+                                                        "this device."
+                                                }
                                             }
-                                        }
-                                    )
+                                        )
+                                    }
                                 }
                             }
                         }
@@ -296,22 +438,7 @@ fun InfoScreen(
                             episodes == null -> item {
                                 Column(modifier = Modifier.padding(horizontal = 16.dp)) {
                                     VegaButton(text = "Load episodes") {
-                                        episodesLoadingFor = episodesLink
-                                        episodesError = null
-                                        scope.launch {
-                                            try {
-                                                val loaded = engine.getEpisodes(
-                                                    provider,
-                                                    episodesLink
-                                                )
-                                                episodesByLink = episodesByLink +
-                                                    (episodesLink to loaded)
-                                            } catch (e: Exception) {
-                                                episodesError = e.message
-                                                    ?: "Failed to load episodes"
-                                            }
-                                            episodesLoadingFor = null
-                                        }
+                                        loadEpisodes(episodesLink)
                                     }
                                     if (episodesError != null) {
                                         Spacer(modifier = Modifier.height(8.dp))
@@ -325,53 +452,48 @@ fun InfoScreen(
                             }
 
                             else -> {
-                                val episodeRefs = episodes.map {
-                                    EpisodeRef(title = it.title, key = it.link)
-                                }
                                 episodes.forEachIndexed { index, episode ->
                                     item {
-                                        PlayRow(title = episode.title) {
+                                        PlayRow(
+                                            title = episode.title,
+                                            badge = (index + 1).toString()
+                                        ) {
                                             selectTarget(
-                                                StreamTarget(
-                                                    key = episode.link,
-                                                    title = episode.title,
-                                                    link = episode.link,
-                                                    type = "series",
-                                                    episodes = episodeRefs,
-                                                    episodeIndex = index
-                                                )
+                                                episodeTarget(episodes, index, "series")
                                             )
                                         }
                                     }
                                     if (target?.key == episode.link) {
                                         item {
-                                            StreamsPanel(
-                                                loading = streamsLoading,
-                                                error = streamsError,
-                                                streams = streams,
-                                                downloadNote = downloadNote,
-                                                onRetry = {
-                                                    target?.let { selectTarget(it) }
-                                                },
-                                                onPlay = { stream, streamIndex ->
-                                                    playStream(stream, streamIndex)
-                                                },
-                                                onDownload = { stream ->
-                                                    val id = DownloadsHelper.enqueue(
-                                                        context,
-                                                        episode.title,
-                                                        stream
-                                                    )
-                                                    downloadNote = if (id >= 0) {
-                                                        "Download started — track it from " +
-                                                            "the notification shade or " +
-                                                            "Downloads tab."
-                                                    } else {
-                                                        "Could not start this download " +
-                                                            "on this device."
+                                            StaggeredIn(index = 0) {
+                                                StreamsPanel(
+                                                    loading = streamsLoading,
+                                                    error = streamsError,
+                                                    streams = streams,
+                                                    downloadNote = downloadNote,
+                                                    onRetry = {
+                                                        target?.let { selectTarget(it) }
+                                                    },
+                                                    onPlay = { stream, streamIndex ->
+                                                        playStream(stream, streamIndex)
+                                                    },
+                                                    onDownload = { stream ->
+                                                        val id = DownloadsHelper.enqueue(
+                                                            context,
+                                                            episode.title,
+                                                            stream
+                                                        )
+                                                        downloadNote = if (id >= 0) {
+                                                            "Download started — track it " +
+                                                                "from the notification " +
+                                                                "shade or Downloads tab."
+                                                        } else {
+                                                            "Could not start this " +
+                                                                "download on this device."
+                                                        }
                                                     }
-                                                }
-                                            )
+                                                )
+                                            }
                                         }
                                     }
                                 }
@@ -398,6 +520,16 @@ fun ExtInfoScreen(
 ) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
+    val listState = rememberLazyListState()
+    val headerParallax by remember {
+        derivedStateOf {
+            if (listState.firstVisibleItemIndex == 0) {
+                listState.firstVisibleItemScrollOffset.toFloat()
+            } else {
+                1000f
+            }
+        }
+    }
 
     var detail by remember(post.link) { mutableStateOf<ExtDetail?>(null) }
     var error by remember(post.link) { mutableStateOf<String?>(null) }
@@ -422,6 +554,21 @@ fun ExtInfoScreen(
         }
     }
 
+    fun toggleSaved() {
+        val meta = detail
+        saved = watchlist.toggle(
+            WatchlistItem(
+                kind = "extension",
+                sourceId = bridge.id,
+                sourceName = bridge.displayName,
+                title = post.title,
+                link = post.link,
+                image = post.image,
+                type = meta?.type ?: ""
+            )
+        )
+    }
+
     fun selectTarget(newTarget: StreamTarget) {
         if (target?.key == newTarget.key && streams != null) {
             target = null
@@ -440,6 +587,25 @@ fun ExtInfoScreen(
             }
             streamsLoading = false
         }
+    }
+
+    fun episodeTarget(meta: ExtDetail, index: Int): StreamTarget {
+        val episode = meta.episodes[index]
+        return StreamTarget(
+            key = episode.data,
+            title = episode.title,
+            link = episode.data,
+            type = meta.type,
+            episodes = meta.episodes.map { EpisodeRef(title = it.title, key = it.data) },
+            episodeIndex = index
+        )
+    }
+
+    fun playFirst() {
+        val meta = detail ?: return
+        if (meta.episodes.isEmpty()) return
+        scope.launch { listState.animateScrollToItem(2) }
+        selectTarget(episodeTarget(meta, 0))
     }
 
     fun playStream(stream: StreamItem, index: Int) {
@@ -465,31 +631,32 @@ fun ExtInfoScreen(
 
     val meta = detail
     LazyColumn(
+        state = listState,
         modifier = Modifier
             .fillMaxSize()
             .background(VegaBlack),
         contentPadding = PaddingValues(bottom = 28.dp)
     ) {
         item {
-            InfoHeader(
-                image = meta?.poster?.takeIf { it.isNotBlank() }
-                    ?: meta?.image?.takeIf { it.isNotBlank() }
-                    ?: post.image,
+            val backdrop = meta?.image?.takeIf { it.isNotBlank() } ?: post.image
+            val poster = meta?.poster?.takeIf { it.isNotBlank() }
+                ?: meta?.image?.takeIf { it.isNotBlank() }
+                ?: post.image
+            BackdropHeader(
+                backdropUrl = backdrop,
+                posterUrl = poster,
+                posterLike = poster == backdrop,
+                title = meta?.title ?: post.title,
+                rating = meta?.rating,
+                facts = listOfNotNull(
+                    meta?.type?.replaceFirstChar { it.uppercase() },
+                    meta?.year?.toString()
+                ).joinToString("  •  "),
+                sourceName = bridge.displayName,
                 saved = saved,
+                parallaxPx = headerParallax,
                 onBack = onBack,
-                onToggleSaved = {
-                    saved = watchlist.toggle(
-                        WatchlistItem(
-                            kind = "extension",
-                            sourceId = bridge.id,
-                            sourceName = bridge.displayName,
-                            title = post.title,
-                            link = post.link,
-                            image = post.image,
-                            type = meta?.type ?: ""
-                        )
-                    )
-                }
+                onToggleSaved = { toggleSaved() }
             )
         }
 
@@ -502,37 +669,35 @@ fun ExtInfoScreen(
 
             else -> {
                 item {
-                    Column(modifier = Modifier.padding(horizontal = 16.dp)) {
-                        Text(
-                            text = meta.title,
-                            color = VegaText,
-                            fontSize = 24.sp,
-                            fontWeight = FontWeight.Bold
-                        )
-                        Spacer(modifier = Modifier.height(8.dp))
-                        val metaLine = listOfNotNull(
-                            meta.type.replaceFirstChar { it.uppercase() },
-                            meta.year?.toString(),
-                            meta.rating?.takeIf { it.isNotBlank() }?.let { "★ $it" },
-                            meta.tags.takeIf { it.isNotEmpty() }
-                                ?.joinToString(", ")
-                        ).joinToString("  •  ")
-                        if (metaLine.isNotBlank()) {
-                            Text(text = metaLine, color = VegaSubText, fontSize = 13.sp)
-                        }
-                        Spacer(modifier = Modifier.height(10.dp))
-                        MetaChip(text = bridge.displayName, accent = true)
-                        if (meta.cast.isNotEmpty()) {
-                            Spacer(modifier = Modifier.height(10.dp))
-                            Text(
-                                text = "Cast: " + meta.cast.joinToString(", "),
-                                color = VegaSubText,
-                                fontSize = 13.sp
+                    StaggeredIn(index = 1) {
+                        Column(modifier = Modifier.fillMaxWidth()) {
+                            val (_, genres) = splitTags(meta.tags)
+                            if (genres.isNotEmpty()) {
+                                LazyRow(
+                                    contentPadding = PaddingValues(horizontal = 16.dp),
+                                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                    modifier = Modifier.padding(top = 14.dp)
+                                ) {
+                                    items(genres) { genre -> MetaChip(text = genre) }
+                                }
+                            }
+                            Spacer(modifier = Modifier.height(16.dp))
+                            InfoActionRow(
+                                saved = saved,
+                                onPlay = { playFirst() },
+                                onToggleSaved = { toggleSaved() }
                             )
-                        }
-                        if (meta.synopsis.isNotBlank()) {
-                            Spacer(modifier = Modifier.height(10.dp))
-                            Text(text = meta.synopsis, color = VegaText, fontSize = 14.sp)
+                            if (meta.synopsis.isNotBlank()) {
+                                Spacer(modifier = Modifier.height(22.dp))
+                                StorylineBlock(
+                                    synopsis = meta.synopsis,
+                                    modifier = Modifier.padding(horizontal = 16.dp)
+                                )
+                            }
+                            if (meta.cast.isNotEmpty()) {
+                                Spacer(modifier = Modifier.height(22.dp))
+                                CastRow(cast = meta.cast)
+                            }
                         }
                     }
                 }
@@ -545,53 +710,51 @@ fun ExtInfoScreen(
                             fontSize = 16.sp,
                             fontWeight = FontWeight.SemiBold,
                             modifier = Modifier.padding(
-                                start = 16.dp, end = 16.dp, top = 22.dp, bottom = 10.dp
+                                start = 16.dp, end = 16.dp, top = 24.dp, bottom = 10.dp
                             )
                         )
                     }
-                    val episodeRefs = meta.episodes.map {
-                        EpisodeRef(title = it.title, key = it.data)
-                    }
                     meta.episodes.forEachIndexed { index, episode ->
                         item {
-                            PlayRow(title = episode.title) {
-                                selectTarget(
-                                    StreamTarget(
-                                        key = episode.data,
-                                        title = episode.title,
-                                        link = episode.data,
-                                        type = meta.type,
-                                        episodes = episodeRefs,
-                                        episodeIndex = index
-                                    )
-                                )
+                            PlayRow(
+                                title = episode.title,
+                                badge = if (meta.episodes.size > 1) {
+                                    (index + 1).toString()
+                                } else {
+                                    null
+                                }
+                            ) {
+                                selectTarget(episodeTarget(meta, index))
                             }
                         }
                         if (target?.key == episode.data) {
                             item {
-                                StreamsPanel(
-                                    loading = streamsLoading,
-                                    error = streamsError,
-                                    streams = streams,
-                                    downloadNote = downloadNote,
-                                    onRetry = { target?.let { selectTarget(it) } },
-                                    onPlay = { stream, streamIndex ->
-                                        playStream(stream, streamIndex)
-                                    },
-                                    onDownload = { stream ->
-                                        val id = DownloadsHelper.enqueue(
-                                            context,
-                                            episode.title,
-                                            stream
-                                        )
-                                        downloadNote = if (id >= 0) {
-                                            "Download started — track it from the " +
-                                                "notification shade or Downloads tab."
-                                        } else {
-                                            "Could not start this download on this device."
+                                StaggeredIn(index = 0) {
+                                    StreamsPanel(
+                                        loading = streamsLoading,
+                                        error = streamsError,
+                                        streams = streams,
+                                        downloadNote = downloadNote,
+                                        onRetry = { target?.let { selectTarget(it) } },
+                                        onPlay = { stream, streamIndex ->
+                                            playStream(stream, streamIndex)
+                                        },
+                                        onDownload = { stream ->
+                                            val id = DownloadsHelper.enqueue(
+                                                context,
+                                                episode.title,
+                                                stream
+                                            )
+                                            downloadNote = if (id >= 0) {
+                                                "Download started — track it from the " +
+                                                    "notification shade or Downloads tab."
+                                            } else {
+                                                "Could not start this download on " +
+                                                    "this device."
+                                            }
                                         }
-                                    }
-                                )
+                                    )
+                                }
                             }
                         }
                     }
@@ -602,46 +765,94 @@ fun ExtInfoScreen(
 }
 
 // ---------------------------------------------------------------------------
-// Shared Info pieces
+// Shared Info pieces (modelled on Vega's Info.tsx + ContentOverview)
 // ---------------------------------------------------------------------------
 
+/**
+ * Backdrop zone: 300dp of artwork with a bottom gradient into black and a
+ * light scroll parallax. When the only artwork is the portrait poster
+ * (posterLike), the backdrop is that poster blurred at 75% opacity over
+ * black — Vega's exact treatment — and the sharp poster card overlaps the
+ * bottom-left next to the title block. A separate landscape image is shown
+ * unblurred instead. Modifier.blur needs API 31+, so older devices get a
+ * dark scrim fallback.
+ */
 @Composable
-private fun InfoHeader(
-    image: String,
+private fun BackdropHeader(
+    backdropUrl: String,
+    posterUrl: String,
+    posterLike: Boolean,
+    title: String,
+    rating: String?,
+    facts: String,
+    sourceName: String,
     saved: Boolean,
+    parallaxPx: Float,
     onBack: () -> Unit,
     onToggleSaved: () -> Unit
 ) {
+    val canBlur = Build.VERSION.SDK_INT >= Build.VERSION_CODES.S
     Box(
         modifier = Modifier
             .fillMaxWidth()
-            .height(300.dp)
-            .background(VegaSurface)
+            .height(372.dp)
+            .background(VegaBlack)
     ) {
-        if (image.isNotBlank()) {
-            AsyncImage(
-                model = image,
-                contentDescription = null,
-                contentScale = ContentScale.Crop,
-                modifier = Modifier.fillMaxSize()
-            )
-        }
-        // Bottom gradient fading the backdrop into the page background.
         Box(
             modifier = Modifier
-                .fillMaxSize()
-                .background(
-                    Brush.verticalGradient(
-                        colors = listOf(
-                            Color.Black.copy(alpha = 0.25f),
-                            Color.Transparent,
-                            VegaBlack
-                        ),
-                        startY = 0f,
-                        endY = Float.POSITIVE_INFINITY
-                    )
+                .fillMaxWidth()
+                .height(300.dp)
+                .align(Alignment.TopCenter)
+                .clipToBounds()
+        ) {
+            if (backdropUrl.isNotBlank()) {
+                AsyncImage(
+                    model = backdropUrl,
+                    contentDescription = null,
+                    contentScale = ContentScale.Crop,
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .offset {
+                            IntOffset(0, (parallaxPx * 0.45f).roundToInt())
+                        }
+                        .scale(if (posterLike) 1.18f else 1.05f)
+                        .alpha(
+                            (if (posterLike) 0.75f else 1f) *
+                                (1f - parallaxPx / 900f).coerceIn(0.3f, 1f)
+                        )
+                        .then(
+                            if (posterLike && canBlur) {
+                                Modifier.blur(20.dp)
+                            } else {
+                                Modifier
+                            }
+                        )
                 )
-        )
+            }
+            if (posterLike && !canBlur) {
+                Box(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .background(Color.Black.copy(alpha = 0.45f))
+                )
+            }
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .background(
+                        Brush.verticalGradient(
+                            colors = listOf(
+                                Color.Black.copy(alpha = 0.30f),
+                                Color.Transparent,
+                                VegaBlack
+                            ),
+                            startY = 0f,
+                            endY = Float.POSITIVE_INFINITY
+                        )
+                    )
+            )
+        }
+
         Row(
             modifier = Modifier
                 .fillMaxWidth()
@@ -656,6 +867,188 @@ private fun InfoHeader(
                 iconFilled = saved,
                 onClick = onToggleSaved
             )
+        }
+
+        // Poster card + title block overlapping the backdrop's bottom edge.
+        Row(
+            modifier = Modifier
+                .align(Alignment.BottomStart)
+                .fillMaxWidth()
+                .padding(horizontal = 16.dp),
+            verticalAlignment = Alignment.Bottom
+        ) {
+            AsyncImage(
+                model = posterUrl,
+                contentDescription = title,
+                contentScale = ContentScale.Crop,
+                modifier = Modifier
+                    .width(104.dp)
+                    .aspectRatio(2f / 3f)
+                    .clip(RoundedCornerShape(12.dp))
+                    .border(1.dp, VegaBorder, RoundedCornerShape(12.dp))
+                    .background(VegaSurface)
+            )
+            Spacer(modifier = Modifier.width(14.dp))
+            Column(
+                modifier = Modifier
+                    .weight(1f)
+                    .padding(bottom = 2.dp)
+            ) {
+                MetaChip(text = sourceName, accent = true)
+                Spacer(modifier = Modifier.height(8.dp))
+                Text(
+                    text = title,
+                    color = VegaText,
+                    fontSize = 21.sp,
+                    fontWeight = FontWeight.Bold,
+                    maxLines = 3,
+                    overflow = TextOverflow.Ellipsis
+                )
+                val cleanRating = rating?.takeIf { it.isNotBlank() }
+                if (cleanRating != null || facts.isNotBlank()) {
+                    Spacer(modifier = Modifier.height(6.dp))
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        if (cleanRating != null) {
+                            Text(
+                                text = "★ $cleanRating",
+                                color = Tomato,
+                                fontSize = 13.sp,
+                                fontWeight = FontWeight.SemiBold
+                            )
+                        }
+                        if (cleanRating != null && facts.isNotBlank()) {
+                            Text(
+                                text = "  •  ",
+                                color = VegaSubText,
+                                fontSize = 13.sp
+                            )
+                        }
+                        if (facts.isNotBlank()) {
+                            Text(text = facts, color = VegaSubText, fontSize = 13.sp)
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/** Wide tomato Play + ghost Watchlist toggle, like Vega's action row. */
+@Composable
+private fun InfoActionRow(
+    saved: Boolean,
+    onPlay: () -> Unit,
+    onToggleSaved: () -> Unit
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 16.dp),
+        horizontalArrangement = Arrangement.spacedBy(10.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        VegaButton(
+            text = "▶  Play",
+            modifier = Modifier
+                .weight(1f)
+                .height(48.dp),
+            onClick = onPlay
+        )
+        GhostButton(
+            text = if (saved) "✓  Saved" else "+  Watchlist",
+            modifier = Modifier.height(48.dp),
+            onClick = onToggleSaved
+        )
+    }
+}
+
+/** "Storyline" with an animated Read more / Show less expansion. */
+@Composable
+private fun StorylineBlock(synopsis: String, modifier: Modifier = Modifier) {
+    var expanded by remember { mutableStateOf(false) }
+    val expandable = synopsis.length > 220
+    Column(
+        modifier = modifier.animateContentSize(
+            animationSpec = vegaTweenSpec(350)
+        )
+    ) {
+        Text(
+            text = "Storyline",
+            color = VegaText,
+            fontSize = 17.sp,
+            fontWeight = FontWeight.SemiBold
+        )
+        Spacer(modifier = Modifier.height(8.dp))
+        Text(
+            text = synopsis,
+            color = VegaText.copy(alpha = 0.88f),
+            fontSize = 14.sp,
+            lineHeight = 20.sp,
+            maxLines = if (expanded) Int.MAX_VALUE else 3,
+            overflow = TextOverflow.Ellipsis
+        )
+        if (expandable) {
+            Spacer(modifier = Modifier.height(6.dp))
+            Text(
+                text = if (expanded) "Show less" else "Read more",
+                color = Tomato,
+                fontSize = 13.sp,
+                fontWeight = FontWeight.SemiBold,
+                modifier = Modifier
+                    .clip(RoundedCornerShape(8.dp))
+                    .pressClickable(pressedScale = 0.94f) { expanded = !expanded }
+                    .padding(horizontal = 4.dp, vertical = 2.dp)
+            )
+        }
+    }
+}
+
+/** Horizontal cast row: circular initial avatars (providers give names only). */
+@Composable
+private fun CastRow(cast: List<String>) {
+    Column {
+        Text(
+            text = "Cast",
+            color = VegaText,
+            fontSize = 17.sp,
+            fontWeight = FontWeight.SemiBold,
+            modifier = Modifier.padding(horizontal = 16.dp)
+        )
+        Spacer(modifier = Modifier.height(10.dp))
+        LazyRow(
+            contentPadding = PaddingValues(horizontal = 16.dp),
+            horizontalArrangement = Arrangement.spacedBy(14.dp)
+        ) {
+            items(cast) { name ->
+                Column(
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    modifier = Modifier.width(64.dp)
+                ) {
+                    Box(
+                        modifier = Modifier
+                            .size(52.dp)
+                            .clip(CircleShape)
+                            .background(VegaSurfaceHigh),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Text(
+                            text = castInitials(name),
+                            color = Tomato,
+                            fontSize = 17.sp,
+                            fontWeight = FontWeight.Bold
+                        )
+                    }
+                    Spacer(modifier = Modifier.height(6.dp))
+                    Text(
+                        text = name,
+                        color = VegaSubText,
+                        fontSize = 11.sp,
+                        maxLines = 2,
+                        overflow = TextOverflow.Ellipsis,
+                        textAlign = TextAlign.Center
+                    )
+                }
+            }
         }
     }
 }
@@ -675,13 +1068,21 @@ private fun InfoSkeleton() {
     }
 }
 
+/**
+ * One tappable link / episode row. Episodes carry a number badge in place
+ * of the play glyph, Vega SeasonList style.
+ */
 @Composable
-private fun PlayRow(title: String, onClick: () -> Unit) {
+private fun PlayRow(
+    title: String,
+    badge: String? = null,
+    onClick: () -> Unit
+) {
     Card(
         modifier = Modifier
             .fillMaxWidth()
             .padding(horizontal = 16.dp, vertical = 4.dp)
-            .clickable { onClick() },
+            .pressClickable(pressedScale = 0.98f) { onClick() },
         shape = RoundedCornerShape(20.dp),
         colors = CardDefaults.cardColors(containerColor = VegaSurface)
     ) {
@@ -689,7 +1090,25 @@ private fun PlayRow(title: String, onClick: () -> Unit) {
             modifier = Modifier.padding(horizontal = 16.dp, vertical = 14.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
-            VegaIcon(name = VegaIconName.Play, tint = Tomato, size = 18.dp)
+            if (badge != null) {
+                Box(
+                    modifier = Modifier
+                        .size(34.dp)
+                        .clip(RoundedCornerShape(10.dp))
+                        .background(VegaSurfaceHigh),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Text(
+                        text = badge,
+                        color = Tomato,
+                        fontSize = 13.sp,
+                        fontWeight = FontWeight.Bold,
+                        maxLines = 1
+                    )
+                }
+            } else {
+                VegaIcon(name = VegaIconName.Play, tint = Tomato, size = 18.dp)
+            }
             Spacer(modifier = Modifier.width(12.dp))
             Text(
                 text = title,
@@ -707,7 +1126,8 @@ private fun PlayRow(title: String, onClick: () -> Unit) {
 
 /**
  * The streams list shown on the Info screen: one card per server with
- * quality / type chips, tap to play, download icon per stream.
+ * quality / type chips, tap to play, download icon per stream. Cards
+ * stagger in and the panel grows/shrinks smoothly.
  */
 @Composable
 private fun StreamsPanel(
@@ -725,6 +1145,7 @@ private fun StreamsPanel(
             .padding(horizontal = 16.dp, vertical = 8.dp)
             .clip(RoundedCornerShape(20.dp))
             .background(VegaSurface.copy(alpha = 0.55f))
+            .animateContentSize(animationSpec = vegaTweenSpec(300))
             .padding(12.dp)
     ) {
         Text(
@@ -749,53 +1170,74 @@ private fun StreamsPanel(
             )
 
             else -> streams.forEachIndexed { index, stream ->
-                Card(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(vertical = 4.dp)
-                        .clickable { onPlay(stream, index) },
-                    shape = RoundedCornerShape(16.dp),
-                    colors = CardDefaults.cardColors(containerColor = VegaSurfaceHigh)
-                ) {
-                    Row(
-                        modifier = Modifier.padding(horizontal = 14.dp, vertical = 12.dp),
-                        verticalAlignment = Alignment.CenterVertically
+                StaggeredIn(index = index) {
+                    Card(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(vertical = 4.dp)
+                            .pressClickable(pressedScale = 0.98f) {
+                                onPlay(stream, index)
+                            },
+                        shape = RoundedCornerShape(16.dp),
+                        colors = CardDefaults.cardColors(
+                            containerColor = VegaSurfaceHigh
+                        )
                     ) {
-                        VegaIcon(name = VegaIconName.Play, tint = Tomato, size = 18.dp)
-                        Spacer(modifier = Modifier.width(10.dp))
-                        Column(modifier = Modifier.weight(1f)) {
-                            Text(
-                                text = stream.server,
-                                color = VegaText,
-                                fontSize = 15.sp,
-                                fontWeight = FontWeight.SemiBold,
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis
-                            )
-                            val chips = listOfNotNull(
-                                stream.quality?.takeIf { it.isNotBlank() }?.let { it + "p" },
-                                stream.tag?.takeIf { it.isNotBlank() },
-                                stream.type.takeIf { it.isNotBlank() }?.uppercase()
-                            )
-                            if (chips.isNotEmpty()) {
-                                Spacer(modifier = Modifier.height(5.dp))
-                                Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                                    chips.forEach { chip -> MetaChip(text = chip) }
-                                }
-                            }
-                        }
-                        Box(
-                            modifier = Modifier
-                                .size(38.dp)
-                                .clip(CircleShape)
-                                .clickable { onDownload(stream) },
-                            contentAlignment = Alignment.Center
+                        Row(
+                            modifier = Modifier.padding(
+                                horizontal = 14.dp, vertical = 12.dp
+                            ),
+                            verticalAlignment = Alignment.CenterVertically
                         ) {
                             VegaIcon(
-                                name = VegaIconName.Download,
-                                tint = VegaSubText,
-                                size = 20.dp
+                                name = VegaIconName.Play,
+                                tint = Tomato,
+                                size = 18.dp
                             )
+                            Spacer(modifier = Modifier.width(10.dp))
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(
+                                    text = stream.server,
+                                    color = VegaText,
+                                    fontSize = 15.sp,
+                                    fontWeight = FontWeight.SemiBold,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                                val chips = listOfNotNull(
+                                    stream.quality?.takeIf { it.isNotBlank() }
+                                        ?.let { it + "p" },
+                                    stream.tag?.takeIf { it.isNotBlank() },
+                                    stream.type.takeIf { it.isNotBlank() }
+                                        ?.uppercase()
+                                )
+                                if (chips.isNotEmpty()) {
+                                    Spacer(modifier = Modifier.height(5.dp))
+                                    Row(
+                                        horizontalArrangement =
+                                            Arrangement.spacedBy(6.dp)
+                                    ) {
+                                        chips.forEach { chip ->
+                                            MetaChip(text = chip)
+                                        }
+                                    }
+                                }
+                            }
+                            Box(
+                                modifier = Modifier
+                                    .size(38.dp)
+                                    .clip(CircleShape)
+                                    .pressClickable(pressedScale = 0.9f) {
+                                        onDownload(stream)
+                                    },
+                                contentAlignment = Alignment.Center
+                            ) {
+                                VegaIcon(
+                                    name = VegaIconName.Download,
+                                    tint = VegaSubText,
+                                    size = 20.dp
+                                )
+                            }
                         }
                     }
                 }

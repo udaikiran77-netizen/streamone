@@ -1,10 +1,12 @@
 package com.streamone.app.ui
 
+import androidx.compose.animation.core.LinearEasing
 import androidx.compose.animation.core.RepeatMode
 import androidx.compose.animation.core.animateFloat
 import androidx.compose.animation.core.infiniteRepeatable
 import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.tween
+import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
@@ -30,10 +32,12 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.darkColorScheme
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.text.font.FontWeight
@@ -84,9 +88,11 @@ fun VegaButton(
     modifier: Modifier = Modifier,
     onClick: () -> Unit
 ) {
+    val interactionSource = remember { MutableInteractionSource() }
     Button(
         onClick = onClick,
-        modifier = modifier,
+        modifier = modifier.animatedPressScale(interactionSource),
+        interactionSource = interactionSource,
         colors = ButtonDefaults.buttonColors(
             containerColor = Tomato,
             contentColor = Color.White
@@ -103,9 +109,11 @@ fun GhostButton(
     modifier: Modifier = Modifier,
     onClick: () -> Unit
 ) {
+    val interactionSource = remember { MutableInteractionSource() }
     Button(
         onClick = onClick,
-        modifier = modifier,
+        modifier = modifier.animatedPressScale(interactionSource),
+        interactionSource = interactionSource,
         colors = ButtonDefaults.buttonColors(
             containerColor = Color.White.copy(alpha = 0.22f),
             contentColor = Color.White
@@ -164,24 +172,29 @@ fun ErrorCard(message: String, modifier: Modifier = Modifier, onRetry: (() -> Un
     }
 }
 
-/** Pulsing dark block used by skeleton loading states (Vega shimmer style). */
+/** Shimmering dark block used by skeleton loading states (Vega style). */
 @Composable
 fun SkeletonBlock(modifier: Modifier = Modifier, corner: Dp = 12.dp) {
     val transition = rememberInfiniteTransition(label = "skeleton")
-    val alpha by transition.animateFloat(
-        initialValue = 0.45f,
+    val shift by transition.animateFloat(
+        initialValue = 0f,
         targetValue = 1f,
         animationSpec = infiniteRepeatable(
-            animation = tween(durationMillis = 900),
-            repeatMode = RepeatMode.Reverse
+            animation = tween(durationMillis = 1300, easing = LinearEasing),
+            repeatMode = RepeatMode.Restart
         ),
-        label = "skeletonAlpha"
+        label = "skeletonShimmer"
+    )
+    // A lighter band sweeping left → right across the base surface colour.
+    val brush = Brush.linearGradient(
+        colors = listOf(VegaSurfaceHigh, Color(0xFF383838), VegaSurfaceHigh),
+        start = Offset(x = -500f + shift * 1600f, y = 0f),
+        end = Offset(x = -100f + shift * 1600f, y = 0f)
     )
     Box(
         modifier = modifier
             .clip(RoundedCornerShape(corner))
-            .background(VegaSurfaceHigh)
-            .alpha(alpha)
+            .background(brush)
     )
 }
 
@@ -211,7 +224,7 @@ fun PosterCard(
     modifier: Modifier = Modifier,
     onClick: () -> Unit
 ) {
-    Column(modifier = modifier.clickable { onClick() }) {
+    Column(modifier = modifier.pressClickable(pressedScale = 0.96f) { onClick() }) {
         AsyncImage(
             model = post.image,
             contentDescription = post.title,
@@ -276,7 +289,7 @@ fun CircleIconButton(
             .size(40.dp)
             .clip(CircleShape)
             .background(Color.Black.copy(alpha = 0.55f))
-            .clickable { onClick() },
+            .pressClickable(pressedScale = 0.92f) { onClick() },
         contentAlignment = Alignment.Center
     ) {
         VegaIcon(name = icon, tint = tint, size = 22.dp, filled = iconFilled)

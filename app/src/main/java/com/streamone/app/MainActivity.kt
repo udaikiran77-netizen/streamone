@@ -5,6 +5,15 @@ import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
+import androidx.compose.animation.AnimatedContent
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.core.animateDpAsState
+import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.slideInVertically
+import androidx.compose.animation.slideOutVertically
+import androidx.compose.animation.togetherWith
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Box
@@ -16,6 +25,8 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -29,7 +40,10 @@ import androidx.compose.runtime.saveable.rememberSaveableStateHolder
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.scale
+import androidx.compose.ui.graphics.lerp
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
@@ -61,6 +75,9 @@ import com.streamone.app.ui.UpdateDialog
 import com.streamone.app.ui.UpdateInfo
 import com.streamone.app.ui.VegaBlack
 import com.streamone.app.ui.VegaBorder
+import com.streamone.app.ui.VegaDpSpring
+import com.streamone.app.ui.VegaSelectionSpring
+import com.streamone.app.ui.vegaTweenSpec
 import com.streamone.app.ui.VegaIcon
 import com.streamone.app.ui.VegaIconName
 import com.streamone.app.ui.VegaSubText
@@ -200,8 +217,21 @@ private fun StreamOneApp(
         stack = stack + dest
     }
 
+    // Popping is deferred: the top destination first plays its exit
+    // animation (it stays composed, marked as exiting), then it is
+    // actually removed from the stack.
+    var exiting by remember { mutableStateOf<Dest?>(null) }
+
     fun pop() {
-        if (stack.isNotEmpty()) stack = stack.dropLast(1)
+        if (exiting != null) return
+        exiting = stack.lastOrNull()
+    }
+
+    LaunchedEffect(exiting) {
+        val leaving = exiting ?: return@LaunchedEffect
+        delay(240)
+        stack = stack - leaving
+        exiting = null
     }
 
     BackHandler(enabled = stack.isNotEmpty()) { pop() }
@@ -219,8 +249,18 @@ private fun StreamOneApp(
                 .fillMaxWidth()
         ) {
             // Tab content; per-tab saveable state survives tab switches.
-            stateHolder.SaveableStateProvider(tab.name) {
-                when (tab) {
+            // Switching tabs crossfades the content, Vega-style.
+            AnimatedContent(
+                targetState = tab,
+                transitionSpec = {
+                    fadeIn(animationSpec = vegaTweenSpec(280)) togetherWith
+                        fadeOut(animationSpec = vegaTweenSpec(180))
+                },
+                label = "tabContent",
+                modifier = Modifier.fillMaxSize()
+            ) { targetTab ->
+                stateHolder.SaveableStateProvider(targetTab.name) {
+                    when (targetTab) {
                     Tab.Home -> HomeTab(
                         engine = engine,
                         providers = providers,
@@ -282,18 +322,16 @@ private fun StreamOneApp(
                         onExtensions = { push(Dest.Extensions) },
                         onAbout = { push(Dest.About) }
                     )
+                    }
                 }
             }
 
             // Full-screen destinations. All of them stay composed so an
-            // Info screen keeps its loaded state under the player.
+            // Info screen keeps its loaded state under the player. Each
+            // one rises + fades in on entry and reverses on exit.
             for (dest in stack) {
                 key(dest) {
-                    Box(
-                        modifier = Modifier
-                            .fillMaxSize()
-                            .background(VegaBlack)
-                    ) {
+                    AnimatedDestHost(visible = dest != exiting) {
                         when (dest) {
                             is Dest.Info -> InfoScreen(
                                 engine = engine,
@@ -350,6 +388,32 @@ private fun StreamOneApp(
 
     startupUpdate?.let { info ->
         UpdateDialog(info = info, onDismiss = { startupUpdate = null })
+    }
+}
+
+/**
+ * Host for one full-screen destination: rises slightly and fades in when it
+ * appears, reverses when [visible] flips to false (the pop is deferred in
+ * StreamOneApp until the exit animation has played).
+ */
+@Composable
+private fun AnimatedDestHost(visible: Boolean, content: @Composable () -> Unit) {
+    var shown by remember { mutableStateOf(false) }
+    LaunchedEffect(Unit) { shown = true }
+    AnimatedVisibility(
+        visible = shown && visible,
+        enter = fadeIn(animationSpec = vegaTweenSpec(320)) +
+            slideInVertically(animationSpec = vegaTweenSpec(350)) { it / 12 },
+        exit = fadeOut(animationSpec = vegaTweenSpec(220)) +
+            slideOutVertically(animationSpec = vegaTweenSpec(240)) { it / 12 }
+    ) {
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .background(VegaBlack)
+        ) {
+            content()
+        }
     }
 }
 
@@ -424,7 +488,20 @@ private fun RowScope.TabButton(
     onSelect: (Tab) -> Unit
 ) {
     val selected = tab == current
-    val tint = if (selected) Tomato else VegaSubText
+    // Selection progress drives the whole button: icon crossfade + scale,
+    // pill indicator width and the label tint all ride the same spring,
+    // mirroring Vega's AnimatedTabIcon (withTiming draw-in on selection).
+    val progress by animateFloatAsState(
+        targetValue = if (selected) 1f else 0f,
+        animationSpec = VegaSelectionSpring,
+        label = "tabProgress"
+    )
+    val pillWidth by animateDpAsState(
+        targetValue = if (selected) 20.dp else 0.dp,
+        animationSpec = VegaDpSpring,
+        label = "tabPill"
+    )
+    val tint = lerp(VegaSubText, Tomato, progress)
     Column(
         modifier = Modifier
             .weight(1f)
@@ -433,13 +510,46 @@ private fun RowScope.TabButton(
             .padding(vertical = 5.dp),
         horizontalAlignment = Alignment.CenterHorizontally
     ) {
-        VegaIcon(name = icon, tint = tint, size = 24.dp, filled = selected)
+        // Tomato pill indicator in a fixed-height slot (no layout jump).
+        Box(
+            modifier = Modifier.height(7.dp),
+            contentAlignment = Alignment.TopCenter
+        ) {
+            Box(
+                modifier = Modifier
+                    .width(pillWidth)
+                    .height(3.dp)
+                    .clip(CircleShape)
+                    .background(Tomato)
+                    .alpha(progress)
+            )
+        }
+        Box(
+            modifier = Modifier.scale(0.9f + 0.14f * progress),
+            contentAlignment = Alignment.Center
+        ) {
+            VegaIcon(
+                name = icon,
+                tint = tint,
+                size = 24.dp,
+                filled = false,
+                modifier = Modifier.alpha(1f - progress)
+            )
+            VegaIcon(
+                name = icon,
+                tint = tint,
+                size = 24.dp,
+                filled = true,
+                modifier = Modifier.alpha(progress)
+            )
+        }
         Spacer(modifier = Modifier.height(3.dp))
         Text(
             text = label,
             color = tint,
             fontSize = 11.sp,
-            fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal
+            fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal,
+            modifier = Modifier.alpha(0.6f + 0.4f * progress)
         )
     }
 }
