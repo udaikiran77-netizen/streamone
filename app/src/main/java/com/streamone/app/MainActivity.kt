@@ -56,6 +56,9 @@ import com.streamone.app.ui.SearchTab
 import com.streamone.app.ui.SettingsTab
 import com.streamone.app.ui.StreamOneTheme
 import com.streamone.app.ui.Tomato
+import com.streamone.app.ui.UpdateChecker
+import com.streamone.app.ui.UpdateDialog
+import com.streamone.app.ui.UpdateInfo
 import com.streamone.app.ui.VegaBlack
 import com.streamone.app.ui.VegaBorder
 import com.streamone.app.ui.VegaIcon
@@ -149,6 +152,20 @@ private fun StreamOneApp(
             delay(600)
         }
         bridges = pluginEngine.bridges()
+    }
+
+    // In-app updates: once per launch, when the auto-check preference is
+    // on, silently ask GitHub for the latest release and surface the
+    // update dialog when one is newer than the installed version. The
+    // manual check lives in Settings (see ui/Tabs.kt) and shares the
+    // dialog. Failures are silent here by design.
+    var startupUpdate by remember { mutableStateOf<UpdateInfo?>(null) }
+    LaunchedEffect(Unit) {
+        if (UpdateChecker.isAutoUpdateEnabled(context)) {
+            UpdateChecker.checkForUpdate(context).onSuccess { info ->
+                if (info != null) startupUpdate = info
+            }
+        }
     }
 
     val activeSource: ActiveSource? = remember(providers, bridges, activeVegaId, activeExtId) {
@@ -329,6 +346,10 @@ private fun StreamOneApp(
         if (stack.isEmpty()) {
             TabBar(current = tab, onSelect = { tab = it })
         }
+    }
+
+    startupUpdate?.let { info ->
+        UpdateDialog(info = info, onDismiss = { startupUpdate = null })
     }
 }
 

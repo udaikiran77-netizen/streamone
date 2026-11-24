@@ -25,8 +25,11 @@ import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.OutlinedTextFieldDefaults
+import androidx.compose.material3.Switch
+import androidx.compose.material3.SwitchDefaults
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -40,6 +43,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.style.TextOverflow
@@ -477,6 +481,45 @@ fun SettingsTab(
     onExtensions: () -> Unit,
     onAbout: () -> Unit
 ) {
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    val currentVersion = remember { UpdateChecker.installedVersionName(context) }
+
+    // App updates state: the auto-check switch, manual-check feedback and
+    // the update found by a manual check (the startup check lives in
+    // MainActivity and shares UpdateDialog).
+    var autoUpdate by remember {
+        mutableStateOf(UpdateChecker.isAutoUpdateEnabled(context))
+    }
+    var checking by remember { mutableStateOf(false) }
+    var checkFeedback by remember { mutableStateOf<String?>(null) }
+    var checkFailed by remember { mutableStateOf(false) }
+    var manualUpdate by remember { mutableStateOf<UpdateInfo?>(null) }
+
+    fun runManualCheck() {
+        if (checking) return
+        checking = true
+        checkFeedback = null
+        checkFailed = false
+        scope.launch {
+            UpdateChecker.checkForUpdate(context)
+                .onSuccess { info ->
+                    checking = false
+                    if (info != null) {
+                        manualUpdate = info
+                    } else {
+                        checkFeedback = "You are on the latest version"
+                    }
+                }
+                .onFailure { e ->
+                    checking = false
+                    checkFailed = true
+                    checkFeedback = "Couldn't check for updates: " +
+                        (e.message ?: "network error")
+                }
+        }
+    }
+
     Column(
         modifier = Modifier
             .fillMaxSize()
@@ -529,6 +572,132 @@ fun SettingsTab(
 
         Spacer(modifier = Modifier.height(22.dp))
         Text(
+            text = "APP UPDATES",
+            color = VegaSubText,
+            fontSize = 12.sp,
+            fontWeight = FontWeight.Bold
+        )
+        Spacer(modifier = Modifier.height(8.dp))
+        Card(
+            shape = RoundedCornerShape(28.dp),
+            colors = CardDefaults.cardColors(containerColor = VegaSurface),
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Column {
+                // Manual check: same row layout as SettingsRow, with a
+                // small spinner in place of the chevron while checking.
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clickable(enabled = !checking) { runManualCheck() }
+                        .padding(horizontal = 16.dp, vertical = 14.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Box(
+                        modifier = Modifier
+                            .size(42.dp)
+                            .clip(RoundedCornerShape(12.dp))
+                            .background(VegaSurfaceHigh),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        VegaIcon(name = VegaIconName.Download, tint = Tomato, size = 22.dp)
+                    }
+                    Spacer(modifier = Modifier.width(14.dp))
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = "Check for updates",
+                            color = VegaText,
+                            fontSize = 16.sp,
+                            fontWeight = FontWeight.Medium
+                        )
+                        Text(
+                            text = "Current version $currentVersion",
+                            color = VegaSubText,
+                            fontSize = 13.sp
+                        )
+                    }
+                    if (checking) {
+                        CircularProgressIndicator(
+                            color = Tomato,
+                            strokeWidth = 2.5.dp,
+                            modifier = Modifier.size(22.dp)
+                        )
+                    } else {
+                        VegaIcon(
+                            name = VegaIconName.ChevronRight,
+                            tint = VegaSubText,
+                            size = 20.dp
+                        )
+                    }
+                }
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 16.dp)
+                        .height(1.dp)
+                        .background(VegaBorder)
+                )
+                // Auto-check toggle, persisted in SharedPreferences.
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 16.dp, vertical = 8.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Box(
+                        modifier = Modifier
+                            .size(42.dp)
+                            .clip(RoundedCornerShape(12.dp))
+                            .background(VegaSurfaceHigh),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        VegaIcon(name = VegaIconName.Check, tint = Tomato, size = 22.dp)
+                    }
+                    Spacer(modifier = Modifier.width(14.dp))
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = "Auto check for updates",
+                            color = VegaText,
+                            fontSize = 16.sp,
+                            fontWeight = FontWeight.Medium
+                        )
+                        Text(
+                            text = "Check GitHub for a new version when the app opens",
+                            color = VegaSubText,
+                            fontSize = 13.sp
+                        )
+                    }
+                    Switch(
+                        checked = autoUpdate,
+                        onCheckedChange = { enabled ->
+                            autoUpdate = enabled
+                            UpdateChecker.setAutoUpdateEnabled(context, enabled)
+                        },
+                        colors = SwitchDefaults.colors(
+                            checkedThumbColor = Color.White,
+                            checkedTrackColor = Tomato,
+                            checkedBorderColor = Tomato,
+                            uncheckedThumbColor = VegaSubText,
+                            uncheckedTrackColor = VegaSurfaceHigh,
+                            uncheckedBorderColor = VegaBorder
+                        )
+                    )
+                }
+            }
+        }
+        if (checkFeedback != null) {
+            Spacer(modifier = Modifier.height(10.dp))
+            Text(
+                text = checkFeedback!!,
+                color = if (checkFailed) Tomato else VegaSubText,
+                fontSize = 13.sp,
+                fontWeight = if (checkFailed) FontWeight.Medium else FontWeight.Normal,
+                modifier = Modifier.padding(horizontal = 4.dp)
+            )
+        }
+
+        Spacer(modifier = Modifier.height(22.dp))
+        Text(
             text = "APP",
             color = VegaSubText,
             fontSize = 12.sp,
@@ -543,10 +712,14 @@ fun SettingsTab(
             SettingsRow(
                 icon = VegaIconName.Info,
                 title = "About",
-                subtitle = "StreamOne • version 1.0.1",
+                subtitle = "StreamOne • version $currentVersion",
                 onClick = onAbout
             )
         }
+    }
+
+    manualUpdate?.let { info ->
+        UpdateDialog(info = info, onDismiss = { manualUpdate = null })
     }
 }
 
@@ -727,6 +900,8 @@ private fun ProviderRow(
 
 @Composable
 fun AboutScreen(onBack: () -> Unit) {
+    val context = LocalContext.current
+    val version = remember { UpdateChecker.installedVersionName(context) }
     Column(
         modifier = Modifier
             .fillMaxSize()
@@ -756,7 +931,7 @@ fun AboutScreen(onBack: () -> Unit) {
                 fontWeight = FontWeight.Bold
             )
             Spacer(modifier = Modifier.height(4.dp))
-            MetaChip(text = "Version 1.0.1", accent = true)
+            MetaChip(text = "Version $version", accent = true)
             Spacer(modifier = Modifier.height(20.dp))
             Card(
                 shape = RoundedCornerShape(28.dp),

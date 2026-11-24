@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<paths>
+    <!-- getExternalFilesDir(DIRECTORY_DOWNLOADS) + "/StreamOne": finished
+         stream downloads and the update.apk handed to the installer. -->
+    <external-files-path
+        name="downloads"
+        path="Download/StreamOne/" />
+    <!-- DownloadsHelper's fallback folder (filesDir/downloads) for devices
+         without an external files dir. -->
+    <files-path
+        name="internal_downloads"
+        path="downloads/" />
+</paths>
